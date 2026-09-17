@@ -17,7 +17,7 @@
 #      init exec 失败 → 现象是「模块装了却毫无反应」（本项目真踩过）
 #
 # 本脚本的做法：
-#   文件清单来自 `git ls-files`（= 只有该进包的东西），排除构建脚本自身；
+#   文件清单来自 `git ls-files`（= 只有该进包的东西），排除构建脚本自身与 CI 配置；
 #   打包前对**将要进包的那批文件**做静态检查；打包后校验 zip 里 module.prop
 #   在根目录（多嵌一层目录会导致装不上）。
 # ============================================================================
@@ -107,11 +107,15 @@ if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --is-inside-work-t
     GV=$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || echo "?")
 fi
 
-# 永不进包的东西（构建脚本自身、git 元数据、运行态、本地取证文件、编辑器杂物）
+# 永不进包的东西（构建脚本自身、git 元数据、CI 配置、运行态、本地取证文件、编辑器杂物）
 is_excluded() {
     case "$1" in
         build.sh|.gitignore|.gitattributes) return 0 ;;
         .git/*|.git)                        return 0 ;;
+        # CI 配置：Release 由 GitHub Actions 构建，workflow 本身是仓库工程文件，
+        # 与「装到设备上的模块」无关。它必须被排除，否则 Actions 打出的包会比
+        # 本地包多出 .github/ 一个条目 → sha256 对不上，可复现验证直接失效。
+        .github/*|.github)                  return 0 ;;
         state/*|*/state/*)                  return 0 ;;
         *.zip|*.sha256|*.log|*.err)         return 0 ;;
         *.bak|*.orig|*.rej|*~|*.swp|*.swo)  return 0 ;;

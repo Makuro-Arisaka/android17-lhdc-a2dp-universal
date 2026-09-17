@@ -1,0 +1,137 @@
+# ============================================================================
+# release.yml — 推送 v* 标签时自动构建并发布 Release
+# ----------------------------------------------------------------------------
+# 为什么用 Actions，而不是本机 gh / REST API：
+#   发布机所在网络对 github.com 与 api.github.com 的 443 做了 SNI 阻断
+#   （DNS 也被投毒成不相干的 IP），本机只剩 ssh.github.com:443 可用 ——
+#   SSH 通道能推 git ref，但**建不了 Release**。
+#   把构建与发布交给 GitHub 自己的 runner，既绕开封锁，也**无需在本地
+#   保存任何令牌**（用 Actions 内置的 GITHUB_TOKEN）。
+#
+# 包由 runner 现场跑 ./build.sh --reproducible 构建：
+#   时间戳取自 commit 时间，因此同一个 commit 在任何机器上构建，
+#   产物字节完全一致 —— Release 附件可以直接和本地包核对 sha256。
+# ============================================================================
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: # 兜底：Actions 页面手动触发，标签名取 module.prop 的 version
+
+permissions:
+  contents: write # 创建 Release、上传附件、必要时补建标签
+
+jobs:
+  release:
+    name: 构建并发布模块
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          # build.sh 用 git describe 取版本、用 git log -1 --format=%ct 取可复现
+          # 时间戳；浅克隆会让这两处失准。
+          fetch-depth: 0
+
+      - name: 安装构建依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq -o Acquire::Retries=3
+          # busybox-static 供 build.sh 做 `busybox ash -n`（贴近设备侧 shell 的
+          # 语法检查）。缺了它脚本会静默退回 `sh -n`，检查强度随之下降。
+          sudo apt-get install -y -qq -o Acquire::Retries=3 busybox-static zip unzip
+          busybox 2>&1 | head -1
+
+      - name: 构建模块包
+        id: build
+        run: |
+          set -euo pipefail
+
+          # 发布标签：push 事件用触发它的标签；手动触发时取自 module.prop。
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG=$(grep -m1 '^version=' module.prop | cut -d= -f2-)
+          fi
+
+          ID=$(grep -m1 '^id=' module.prop | cut -d= -f2-)
+          NAME=$(grep -m1 '^name=' module.prop | cut -d= -f2-)
+          DESC=$(grep -m1 '^description=' module.prop | cut -d= -f2-)
+
+          # dist/ 已在 .gitignore 中，所以建这个目录不会让 build.sh 的脏检查拒绝打包。
+          mkdir -p dist
+          ./build.sh --reproducible -o "$PWD/dist/${ID}.zip"
+
+          ZIP="dist/${ID}.zip"
+          SHA256=$(cut -d' ' -f1 "${ZIP}.sha256")
+          SIZE=$(stat -c %s "$ZIP")
+
+          # ---- 用模板生成 Release 说明（占位符替换，避免在 YAML 里嵌 heredoc）----
+          # sed 替换串里 & | \ 是元字符，先转义。
+          esc() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
+          sed \
+            -e "s|{{DESC}}|$(esc "$DESC")|g" \
+            -e "s|{{ID}}|$(esc "$ID")|g" \
+            -e "s|{{TAG}}|$(esc "$TAG")|g" \
+            -e "s|{{SHA256}}|$(esc "$SHA256")|g" \
+            -e "s|{{SIZE}}|${SIZE}|g" \
+            -e "s|{{SHA}}|${GITHUB_SHA}|g" \
+            -e "s|{{REPO}}|${GITHUB_REPOSITORY}|g" \
+            .github/RELEASE_TEMPLATE.md > RELEASE_BODY.md
+
+          if grep -q '{{' RELEASE_BODY.md; then
+            echo "::error title=模板占位符未替换::RELEASE_BODY.md 里仍有 {{...}}"
+            grep -n '{{' RELEASE_BODY.md
+            exit 1
+          fi
+
+          {
+            echo "### 构建结果"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 模块 ID | \`${ID}\` |"
+            echo "| 标签 | \`${TAG}\` |"
+            echo "| 提交 | \`${GITHUB_SHA}\` |"
+            echo "| 大小 | ${SIZE} 字节 |"
+            echo "| sha256 | \`${SHA256}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "tag=${TAG}"
+            echo "id=${ID}"
+            echo "name=${NAME}"
+            echo "sha256=${SHA256}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 复验可复现性（同 commit 重建应得到同一 sha256）
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ID="${{ steps.build.outputs.id }}"
+          A="${{ steps.build.outputs.sha256 }}"
+          mkdir -p dist/repro-check
+          ./build.sh --reproducible -o "$PWD/dist/repro-check/${ID}.zip" >/dev/null
+          B=$(cut -d' ' -f1 "dist/repro-check/${ID}.zip.sha256")
+          if [ "$A" = "$B" ]; then
+            echo "[OK] 可复现复验通过：$A"
+            echo "**可复现复验通过**：同 commit 两次构建 sha256 一致（\`$A\`）。" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning title=可复现复验未通过::首次 $A / 二次 $B"
+            echo "**注意**：两次构建 sha256 不一致（$A / $B）。" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 创建 Release 并上传附件
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.build.outputs.tag }}
+          name: ${{ steps.build.outputs.name }} ${{ steps.build.outputs.tag }}
+          body_path: RELEASE_BODY.md
+          draft: false
+          prerelease: false
+          files: |
+            dist/*.zip
+            dist/*.sha256

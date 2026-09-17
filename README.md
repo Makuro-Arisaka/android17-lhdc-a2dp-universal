@@ -484,7 +484,12 @@ android17-lhdc-a2dp-universal/
 ├── lib/
 │   ├── common.sh          共享函数库（定位、备份、打补丁、挂载）
 │   └── patch_policy.awk   XML 补丁器（POSIX awk）
+├── .github/
+│   ├── workflows/release.yml   推 v* 标签即自动构建 + 发版（**不进包**）
+│   └── RELEASE_TEMPLATE.md     Release 说明模板（**不进包**）
 ├── build.sh               打包脚本（**开发者用，不进包**）
+├── README.md              文档
+├── LICENSE                GPL-3.0 全文
 └── state/                 运行时生成，含备份与日志（**不进包**）
 ```
 
@@ -529,6 +534,45 @@ adb shell su -c 'ksud module install /data/local/tmp/android17-lhdc-a2dp-univers
 ```
 
 KernelSU 会先放进 `modules_update/`，**重启后才转正**。本项目惯例再存一份到 `/sdcard/`。
+
+### 下载预编译包（Releases）
+
+不想自己构建的话，直接取 [Releases](/Makuro-Arisaka/android17-lhdc-a2dp-universal/releases) 里的附件：
+
+| 附件 | 说明 |
+|---|---|
+| `android17-lhdc-a2dp-universal.zip` | 模块包，直接装 |
+| `android17-lhdc-a2dp-universal.zip.sha256` | 校验和 |
+
+这些包由 GitHub Actions 在对应提交上跑 `./build.sh --reproducible` 构建，**不是手工上传的二进制**：
+时间戳取自 commit 时间，所以同一个 commit 在任何机器上构建，产物字节完全一致 —— 你可以自己
+
+```bash
+git checkout v2.1.1 && ./build.sh --reproducible
+```
+
+复现出同一个 sha256，来核对附件确实来自那个提交的源码。
+
+> 之所以走 Actions 而不是本地 `gh release`：发布机所在网络对 `github.com` 与
+> `api.github.com` 的 443 做了 SNI 阻断（DNS 也被投毒），只剩 `ssh.github.com:443` 通 ——
+> 而 SSH 通道能推代码、**建不了 Release**。交给 runner 执行，还顺带免掉了在本地存令牌。
+
+### 发版流程（维护者）
+
+```bash
+# 1) 改 module.prop 的 version / versionCode
+# 2) 提交
+git commit -am "release v2.1.2"
+# 3) 打标签推上去 —— 这一步就会触发构建与发版
+git tag v2.1.2 && git push origin v2.1.2
+```
+
+workflow 在 [`.github/workflows/release.yml`](.github/workflows/release.yml)：
+装 `busybox-static` → `./build.sh --reproducible` → 复验「同 commit 两次构建 sha256 一致」→
+创建 Release 并上传 `zip` 与 `.sha256`。说明文案取自
+[`.github/RELEASE_TEMPLATE.md`](.github/RELEASE_TEMPLATE.md)（`{{...}}` 占位符自动填）。
+
+`.github/` 已在 `build.sh` 的排除表里，不会混进模块包。
 
 ### 从旧 ID 迁移（`lhdc-a2dp-universal` → `android17-lhdc-a2dp-universal`）
 

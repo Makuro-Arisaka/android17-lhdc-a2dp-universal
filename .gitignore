@@ -7,6 +7,12 @@
 *.zip
 *.sha256
 
+# --- Actions 构建输出 ---
+# workflow 把包打在 dist/ 下，再作为 Release 附件上传；
+# 之所以要显式忽略：build.sh 会拒绝在有未跟踪文件的工作区里打包，
+# 忽略掉才能让 CI 里「先建目录、再打包」这一步顺利通过。
+dist/
+
 # --- 运行态 ---
 # 设备上写在 /data/adb/modules/<id>/state/；
 # 本地跑 ./post-fs-data.sh --dry-run 也会生成，别提交。
