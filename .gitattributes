@@ -1,0 +1,33 @@
+# ============================================================================
+# lhdc-a2dp-universal — 行尾与二进制标记
+# ----------------------------------------------------------------------------
+# 全部强制 LF。原因：这些脚本直接在设备的 /system/bin/sh 上 exec，
+# 一旦带 CRLF，shebang 会变成 "#!/system/bin/sh\r"，init 报
+# "No such file or directory" —— 现象是「模块装了但毫无反应」，极难查。
+# 从 Windows 克隆/编辑后提交时，这条规则会把行尾自动拉回 LF。
+# ============================================================================
+
+* text=auto eol=lf
+
+*.sh     text eol=lf
+*.awk    text eol=lf
+*.conf   text eol=lf
+*.prop   text eol=lf
+*.policy text eol=lf
+*.rc     text eol=lf
+*.xml    text eol=lf
+*.md     text eol=lf
+
+# 二进制
+*.zip     binary
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.webp    binary
+*.keystore binary
+*.so      binary
+
+# 语言统计与冲突提示
+*.md      diff
+lib/common.sh linguist-language=Shell
+*.awk     linguist-language=Awk

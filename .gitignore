@@ -1,0 +1,39 @@
+# ============================================================================
+# lhdc-a2dp-universal — 忽略规则
+# 仓库只装「源文件」；运行态产物和打包结果都不入库。
+# ============================================================================
+
+# --- 打包产物（Release 附件，不进版本库）---
+*.zip
+*.sha256
+
+# --- 运行态 ---
+# 设备上写在 /data/adb/modules/<id>/state/；
+# 本地跑 ./post-fs-data.sh --dry-run 也会生成，别提交。
+state/
+run.log
+patch.err
+*.err
+*.log
+
+# --- 从设备拉回的取证文件（原厂 xml 备份 / dumpsys 输出）---
+ap.txt
+af.txt
+bt*.txt
+dumpsys*.txt
+*.dump
+
+# --- 编辑器 / IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.rej
+
+# --- 系统文件 ---
+.DS_Store
+Thumbs.db
+desktop.ini
