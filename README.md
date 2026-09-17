@@ -468,11 +468,55 @@ adb shell "su -c '/system/bin/reboot'"
 lhdc-a2dp-universal/
 ├── module.prop            模块声明
 ├── lhdc.conf              用户配置
+├── customize.sh           安装期：补脚本权限（KernelSU 解压会丢 x 位）
 ├── post-fs-data.sh        开机早段：定位 → 备份 → 打补丁 → 挂载
 ├── service.sh             开机后：校验 / 反查活跃策略 / 导出备份
 ├── uninstall.sh           卸载：摘挂载 + 原文件体检 + 必要时兜住
 ├── lib/
 │   ├── common.sh          共享函数库（定位、备份、打补丁、挂载）
 │   └── patch_policy.awk   XML 补丁器（POSIX awk）
-└── state/                 运行时生成，含备份与日志
+├── build.sh               打包脚本（**开发者用，不进包**）
+└── state/                 运行时生成，含备份与日志（**不进包**）
 ```
+
+---
+
+## 构建与打包
+
+```bash
+./build.sh                      # → ../lhdc-a2dp-universal.zip + .sha256
+./build.sh --reproducible       # 可复现：同一个 commit 打出的包字节完全相同
+./build.sh -o /tmp/xx.zip       # 指定输出
+./build.sh --allow-dirty        # 工作区有未提交改动时也放行
+./build.sh -h                   # 全部参数
+```
+
+**不要手工 `zip -r`**，有三个坑：
+
+| 坑 | 后果 |
+|---|---|
+| 把 `.git/`、`.gitignore` 打进去 | 体积翻倍，还可能把历史一起散出去 |
+| 把 `state/`、`ap.txt`、`dumpsys.txt` 等打进去 | 包不干净；取证文件可能含你的设备信息 |
+| 忘了 `chmod 755` | 装到设备上 `post-fs-data.sh` 没有 `+x`，init exec 失败 —— 现象是**「模块装了却毫无反应」**，日志里一行都没有 |
+
+`build.sh` 的做法：
+
+- **文件清单取自 `git ls-files`** —— 只有该进包的东西才会进包，不靠手写黑名单
+  （不在 git 仓库里时退回 `find` + 黑名单模式）
+- **工作区不干净就拒绝打包**（未提交/未跟踪的改动会让产物与仓库状态对不上）；
+  用 `--allow-dirty` 可放行，并会明确警告「`??` 开头的未跟踪文件不会进包」
+- **静态检查**：必需文件齐全、行尾必须 LF（含 CRLF 直接拒绝）、无 BOM、
+  `busybox ash -n` 语法检查（贴近设备侧 shell）、`*.sh` 语法、awk 脚本语法
+- **打包后自检**：`module.prop` 必须在 zip **根目录**（多嵌一层目录会装不上）、
+  不得混入 `.git` / `state/`、zip 内权限位必须是脚本 755 / 数据 644
+- 同时输出 `.sha256`，方便核对「设备上那个包 == 这个 commit」
+
+把包装到设备：
+
+```bash
+adb push ../lhdc-a2dp-universal.zip /data/local/tmp/
+adb shell su -c 'ksud module install /data/local/tmp/lhdc-a2dp-universal.zip'   # KernelSU
+# Magisk：在管理器里选「从本地安装」那个 zip
+```
+
+KernelSU 会先放进 `modules_update/`，**重启后才转正**。本项目惯例再存一份到 `/sdcard/`。
