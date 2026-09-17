@@ -1,4 +1,8 @@
-# LHDC A2DP Enabler (universal)
+# LHDC A2DP Enabler (Android 17 universal)
+
+> **模块 ID / 仓库名**：`android17-lhdc-a2dp-universal`
+> 2026-09-18 更名，**曾用名 `lhdc-a2dp-universal`**。代码逐字节未动，只换了标识；
+> 但**换 ID 等于换模块** —— 设备上必须先卸旧的再装新的（见「从旧 ID 迁移」）。
 
 让 **Android 17 的原生 LHDC** 真正出声的 Magisk / KernelSU / APatch 模块。
 
@@ -272,7 +276,7 @@ Root 侧无门槛：Magisk / KernelSU / APatch 都行（只用 `post-fs-data.sh`
 
 ```sh
 # 只报告，不改动任何东西
-su -c 'sh /data/adb/modules/lhdc-a2dp-universal/post-fs-data.sh --dry-run'
+su -c 'sh /data/adb/modules/android17-lhdc-a2dp-universal/post-fs-data.sh --dry-run'
 ```
 
 输出包含：SDK、HAL 是否就位、awk 是否可用、offload 属性、所有候选策略文件及其状态、
@@ -280,7 +284,7 @@ su -c 'sh /data/adb/modules/lhdc-a2dp-universal/post-fs-data.sh --dry-run'
 源侧父挂载的传播模式、private 工具是否可用、**运行态（audioserver 是否真的加载了补丁策略）**、最近日志。
 
 ```
-=== lhdc-a2dp-universal 诊断 ===
+=== android17-lhdc-a2dp-universal 诊断 ===
 SDK            : 37  (MIN_SDK=37, FORCE=0)
 AOSP BT HAL    : yes
 awk            : awk
@@ -317,7 +321,7 @@ offload 属性   : supported=true disabled=
 > 「源侧传播模式」与「当前挂载层」两行不是矛盾：前者说的是父挂载（/vendor，常年 shared，
 > 无法也不该改），后者说的是**我们自己挂的那层**（必须是 private）。
 
-日志文件：`/data/adb/modules/lhdc-a2dp-universal/state/run.log`
+日志文件：`/data/adb/modules/android17-lhdc-a2dp-universal/state/run.log`
 （注意：开机早期的时间戳是 `1970-…`，RTC 尚未同步，判断先后请按行序）
 
 ---
@@ -462,7 +466,7 @@ adb shell "su -c '/system/bin/reboot'"
    并提示你先重刷 vendor 再重启
 
 原厂备份的位置：
-- 设备内：`/data/adb/modules/lhdc-a2dp-universal/state/golden/`
+- 设备内：`/data/adb/modules/android17-lhdc-a2dp-universal/state/golden/`
 - 可随时取回：`/sdcard/lhdc-a2dp-backup/`（开机后自动导出）
 
 ---
@@ -470,7 +474,7 @@ adb shell "su -c '/system/bin/reboot'"
 ## 目录结构
 
 ```
-lhdc-a2dp-universal/
+android17-lhdc-a2dp-universal/
 ├── module.prop            模块声明
 ├── lhdc.conf              用户配置
 ├── customize.sh           安装期：补脚本权限（KernelSU 解压会丢 x 位）
@@ -489,7 +493,7 @@ lhdc-a2dp-universal/
 ## 构建与打包
 
 ```bash
-./build.sh                      # → ../lhdc-a2dp-universal.zip + .sha256
+./build.sh                      # → ../android17-lhdc-a2dp-universal.zip + .sha256
 ./build.sh --reproducible       # 可复现：同一个 commit 打出的包字节完全相同
 ./build.sh -o /tmp/xx.zip       # 指定输出
 ./build.sh --allow-dirty        # 工作区有未提交改动时也放行
@@ -519,9 +523,28 @@ lhdc-a2dp-universal/
 把包装到设备：
 
 ```bash
-adb push ../lhdc-a2dp-universal.zip /data/local/tmp/
-adb shell su -c 'ksud module install /data/local/tmp/lhdc-a2dp-universal.zip'   # KernelSU
+adb push ../android17-lhdc-a2dp-universal.zip /data/local/tmp/
+adb shell su -c 'ksud module install /data/local/tmp/android17-lhdc-a2dp-universal.zip'   # KernelSU
 # Magisk：在管理器里选「从本地安装」那个 zip
 ```
 
 KernelSU 会先放进 `modules_update/`，**重启后才转正**。本项目惯例再存一份到 `/sdcard/`。
+
+### 从旧 ID 迁移（`lhdc-a2dp-universal` → `android17-lhdc-a2dp-universal`）
+
+**换 ID 就是换了一个模块**，旧的那份必须卸干净，否则两份会各挂一层 overlay
+（同一个目标文件上出现 4 层），容易误判：
+
+```bash
+# 1) 先装新的（KernelSU 会放进 modules_update/，重启时转正）
+adb push android17-lhdc-a2dp-universal.zip /data/local/tmp/
+adb shell su -c 'ksud module install /data/local/tmp/android17-lhdc-a2dp-universal.zip'
+# 2) 再删旧的：标记后重启即生效
+adb shell su -c 'ksud module uninstall lhdc-a2dp-universal'
+# 3) 重启，然后确认只剩一个新 ID、且挂载正好 2 层
+adb shell su -c 'ls /data/adb/modules/'
+```
+
+旧模块的 `state/`（原厂备份、运行日志）随删除一起消失，不影响使用 ——
+新模块开机时会重新从设备上现读原厂 XML 再备份一次。
+升级源码时也别忘了同步 `lhdc.conf` 里的自定义项。

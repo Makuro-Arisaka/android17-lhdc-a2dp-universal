@@ -1,15 +1,15 @@
 #!/system/bin/sh
 # ============================================================================
-# lhdc-a2dp-universal — 卸载脚本
+# android17-lhdc-a2dp-universal — 卸载脚本
 # 卸载时会摘掉 overlay，让分区上的真实文件重新可见，并检查它是否完好。
 # ============================================================================
 
 [ -n "$MODDIR" ] || MODDIR=${0%/*}
-[ -d "$MODDIR" ] || MODDIR=/data/adb/modules/lhdc-a2dp-universal
+[ -d "$MODDIR" ] || MODDIR=/data/adb/modules/android17-lhdc-a2dp-universal
 
 . "$MODDIR/lib/common.sh"
 
-echo "=== lhdc-a2dp-universal 卸载 ==="
+echo "=== android17-lhdc-a2dp-universal 卸载 ==="
 
 bridged=0
 for dst in $(lc_find_candidates); do

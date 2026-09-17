@@ -1,10 +1,10 @@
 #!/system/bin/sh
 # ============================================================================
-# common.sh — lhdc-a2dp-universal 共享函数库
+# common.sh — android17-lhdc-a2dp-universal 共享函数库
 # post-fs-data.sh / service.sh 都 source 它；也可单独 source 做诊断
 # ============================================================================
 
-LHDC_ID=lhdc-a2dp-universal
+LHDC_ID=android17-lhdc-a2dp-universal
 [ -n "$MODDIR" ] || MODDIR=/data/adb/modules/$LHDC_ID
 [ -d "$MODDIR" ] || MODDIR=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)
 
@@ -734,7 +734,7 @@ lc_learn_active() {
 
 lc_report() {
     local base=$1
-    echo "=== lhdc-a2dp-universal 诊断 ==="
+    echo "=== android17-lhdc-a2dp-universal 诊断 ==="
     echo "SDK            : $(getprop ro.build.version.sdk)  (MIN_SDK=$MIN_SDK, FORCE=$FORCE)"
     echo "AOSP BT HAL    : $(lc_hal_present && echo yes || echo NO)"
     echo "awk            : $(lc_pick_awk && echo "$LHDC_AWK" || echo MISSING)"

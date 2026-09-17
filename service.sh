@@ -1,6 +1,6 @@
 #!/system/bin/sh
 # ============================================================================
-# lhdc-a2dp-universal — service 阶段（late_start）
+# android17-lhdc-a2dp-universal — service 阶段（late_start）
 # 职责：1) 校验 overlay 是否生效，未生效则补做
 #       2) 运行态校验：audioserver 是否真的加载了补丁策略，否则重启它重载
 #       3) 从运行中的 audioserver 反查它真正加载了哪个策略文件，供下次开机直接命中
@@ -9,7 +9,7 @@
 # ============================================================================
 
 [ -n "$MODDIR" ] || MODDIR=${0%/*}
-[ -d "$MODDIR" ] || MODDIR=/data/adb/modules/lhdc-a2dp-universal
+[ -d "$MODDIR" ] || MODDIR=/data/adb/modules/android17-lhdc-a2dp-universal
 
 . "$MODDIR/lib/common.sh"
 
