@@ -147,6 +147,19 @@ else
     done < <(find . -type f | sed 's|^\./||')
 fi
 [ ${#FILES[@]} -gt 0 ] || die "没有可打包的文件"
+
+# 固定条目顺序。不排的话，顺序取决于文件系统的 readdir 顺序，
+# 本机（ext4）和 CI（overlayfs）读出来的顺序不同 ——
+# 结果是包内容一模一样、字节却不同，可复现性失效。
+mapfile -t FILES < <(printf '%s\n' "${FILES[@]}" | LC_ALL=C sort)
+
+# 补回父目录条目：显式传文件列表时 zip 不会自动建目录条目（`zip -r .` 会），
+# 这里把每个文件的各级父目录也算进来，保持与旧包相同的目录结构。
+mapfile -t DIRS < <(printf '%s\n' "${FILES[@]}" \
+    | awk -F/ 'NF>1 { s=""; for (i=1; i<NF; i++) { s = s (i>1 ? "/" : "") $i; print s } }' \
+    | LC_ALL=C sort -u)
+FILES=("${DIRS[@]}" "${FILES[@]}")
+
 note "来源：$SRC，共 ${#FILES[@]} 个文件"
 
 # 脏检查：未提交 / 未跟踪的内容会让「构建产物」与「仓库状态」对不上。
@@ -243,17 +256,31 @@ trap 'rm -rf "$STAGE"' EXIT
 
 step "暂存"
 for f in "${FILES[@]}"; do
+    if [ -d "$f" ]; then
+        # 目录条目（如 lib）：建出目录即可，条目由 zip 负责记录
+        mkdir -p "$STAGE/$f"
+        continue
+    fi
     mkdir -p "$STAGE/$(dirname -- "$f")"
     cp -p -- "$f" "$STAGE/$f"
 done
 
-# 权限与 customize.sh 保持一致：脚本 755，数据/文档 644。
+# 权限与 customize.sh 保持一致：目录 755，根目录脚本 755，数据/文档 644。
 # （设备侧 customize.sh 还会再补一次，这里做是为了 zip 本身也正确。）
-find "$STAGE" -name '*.sh' -exec chmod 755 {} +
-chmod 644 "$STAGE"/module.prop "$STAGE"/lhdc.conf 2>/dev/null || true
-chmod 644 "$STAGE"/lib/* 2>/dev/null || true
-[ -f "$STAGE/README.md" ] && chmod 644 "$STAGE/README.md"
-ok "已写入 $(du -sh "$STAGE" | cut -f1) 到暂存区"
+#
+# 这里是**全量显式设置**，不依赖源文件自身的权限位：`cp -p` 会原样保留源权限，
+# 而本机仓库和 CI（git checkout）里同一批文件的权限并不一致 ——
+# 本地常见 664/775（受 umask 与历史影响），CI 是 644/755。
+# 这个差异会被写进 zip 的条目属性，让「同一个 commit 在不同机器上构建」
+# 得到不同的 sha256，可复现性直接失效。
+#
+# 注意 `-maxdepth 1`：只有**根目录**那 4 个脚本由 init 直接 exec，需要 755；
+# lib/ 下的 common.sh 只是被 source，644 才是对的。
+# （写成 `find ... -name '*.sh'` 会把它一起设成 755，改成通用规则后更容易踩到。）
+find "$STAGE" -type d -exec chmod 755 {} +
+find "$STAGE" -type f -exec chmod 644 {} +
+find "$STAGE" -maxdepth 1 -type f -name '*.sh' -exec chmod 755 {} +
+ok "已写入 $(du -sh "$STAGE" | cut -f1) 到暂存区（权限已统一：目录 755 / 根脚本 755 / 其余 644）"
 
 if [ "$REPRO" = 1 ]; then
     STAMP=${SOURCE_DATE_EPOCH:-}
@@ -268,7 +295,10 @@ fi
 # ---------------------------------------------------------------- 打包
 step "打包"
 rm -f "$OUT_DIR"
-( cd "$STAGE" && TZ="${TZ:-UTC}" zip -X -r -q "$OUT_DIR" . )
+# 显式传文件列表（而不是 `zip -r ... .`）才能让条目顺序可控 ——
+# 传 `.` 是让 zip 自己递归，顺序就落回 readdir 了。
+# 目录条目（如 lib/）由 zip 在添加其下第一个文件时自动补上。
+( cd "$STAGE" && TZ="${TZ:-UTC}" zip -X -q "$OUT_DIR" "${FILES[@]}" )
 [ -s "$OUT_DIR" ] || die "打包失败：$OUT_DIR 不存在或为空"
 
 # --- 打包后自检：这几条错了就是「装了没反应」---
