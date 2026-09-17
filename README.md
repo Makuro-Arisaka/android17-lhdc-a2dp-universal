@@ -1,13 +1,10 @@
 # LHDC A2DP Enabler (Android 17 universal)
 
-> **模块 ID / 仓库名**：`android17-lhdc-a2dp-universal`
-> 2026-09-18 更名，**曾用名 `lhdc-a2dp-universal`**。代码逐字节未动，只换了标识；
-> 但**换 ID 等于换模块** —— 设备上必须先卸旧的、再装新的，然后重启；
-> 否则同一个策略文件上会叠出 4 层 overlay，而自检只看内容不看层数，会照样报 OK。
-
 让 **Android 17 的原生 LHDC** 真正出声的 Magisk / KernelSU / APatch 模块。
 
 面向这一类设备：**LHDC 协商成功（`Current Codec: LHDCv5`）但完全没声音**。
+
+本模块由`DeepSeekV4.1Flash`制作。
 
 ---
 
