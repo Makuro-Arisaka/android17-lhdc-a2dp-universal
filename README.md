@@ -116,11 +116,16 @@ mount: bad /etc/fstab: No such file or directory
 
 AOSP 的 `audio_policy_configuration.xml` 里，列表型属性用哪种分隔符**不是固定的**，随 ROM 而变：
 
-| 属性 | Redmi K20 Pro（Android 17） | POCO F5 / marble（Android 16） |
+| 属性 | Redmi K20 Pro / raphael（Android 17） | Redmi Note 12 Turbo / marble（Android 17） |
 |---|---|---|
 | `samplingRates` | **逗号** `48000,96000` | 空格 `48000 96000` |
 | `channelMasks` | **逗号** | 空格 |
 | `encodedFormats` | 空格 | 空格 |
+
+> **分隔符风格跟 Android 版本没关系，别想按机型/版本推断** —— 上表两台**都是
+> Android 17 / SDK 37**，风格却完全相反。它取决于**那份原厂 XML 是谁写的**
+> （vendor 分支 / ROM 移植来源不同），所以只能**逐台探测**。
+> 这正是 `detect_sep()` 存在的理由。
 
 v2.0.x 的 `patch_policy.awk` 把空格**写死了**（照搬 marble 的写法），于是移植到 K20 Pro 之后：
 
@@ -167,7 +172,7 @@ I AS.AudioDeviceInventory: APM failed to make available A2DP device addr=… err
 v2.1.0 的判定方式是把一批属性**混成一个字符串**再做**子串**匹配，于是：
 
 ```
-marble（POCO F5 / Redmi Note 12 Turbo）真实属性
+Redmi Note 12 Turbo / marble 真实属性
   ro.boot.product.vendor.sku = ukee      ← 这才是 sku 名
   ro.boot.hardware.sku       = marble    ← 设备名，不是 sku
   ro.board.platform          = taro      ← 平台名！和 sku_taro 撞名了
@@ -404,7 +409,7 @@ adb shell "su -c 'dmesg | grep -c dspservice'"    # 这台 K20 Pro 实测每 5 �
 恢复机制被触发**（`apexd` 会尝试回滚那个 APEX），这与本模块无关 —— 本模块只改一个
 `audio_policy_configuration.xml`，不可能让别的原生进程收到 `SIGSYS`。
 
-### 真实案例（Redmi K20 Pro / Android 17 移植 ROM）
+### 真实案例（Redmi K20 Pro / raphael，Android 17 移植 ROM）
 
 ```
 [ 9.70] init: Service 'vendor.dspservice' (pid 1331) received SIGSYS     ← 启动后 ~100ms 就被杀
