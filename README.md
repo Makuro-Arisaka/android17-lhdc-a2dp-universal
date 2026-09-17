@@ -553,60 +553,11 @@ git checkout v2.1.1 && ./build.sh --reproducible
 
 复现出同一个 sha256，来核对附件确实来自那个提交的源码。
 
-> 之所以走 Actions 而不是本地 `gh release`：发布机所在网络对 `github.com` 与
-> `api.github.com` 的 443 做了 SNI 阻断（DNS 也被投毒），只剩 `ssh.github.com:443` 通 ——
-> 而 SSH 通道能推代码、**建不了 Release**。交给 runner 执行，还顺带免掉了在本地存令牌。
-
-### 发版流程（维护者）
-
-```bash
-# 1) 改 module.prop 的 version / versionCode
-# 2) 提交
-git commit -am "release v2.1.2"
-# 3) 打标签推上去 —— 这一步就会触发构建与发版
-git tag v2.1.2 && git push origin v2.1.2
-```
-
-workflow 在 [`.github/workflows/release.yml`](.github/workflows/release.yml)：
-装 `busybox-static` → `./build.sh --reproducible` → 复验「同 commit 两次构建 sha256 一致」→
-创建 Release 并上传 `zip` 与 `.sha256`。说明文案取自
-[`.github/RELEASE_TEMPLATE.md`](.github/RELEASE_TEMPLATE.md)（`{{...}}` 占位符自动填）。
-
-`.github/` 已在 `build.sh` 的排除表里，不会混进模块包。
-
-### 从旧 ID 迁移（`lhdc-a2dp-universal` → `android17-lhdc-a2dp-universal`）
-
-**换 ID 就是换了一个模块**，旧的那份必须卸干净，否则两份会各挂一层 overlay
-（同一个目标文件上出现 4 层），容易误判：
-
-```bash
-# 1) 先装新的（KernelSU 会放进 modules_update/，重启时转正）
-adb push android17-lhdc-a2dp-universal.zip /data/local/tmp/
-adb shell su -c 'ksud module install /data/local/tmp/android17-lhdc-a2dp-universal.zip'
-# 2) 再删旧的：标记后重启即生效
-adb shell su -c 'ksud module uninstall lhdc-a2dp-universal'
-# 3) 重启，然后确认只剩一个新 ID、且挂载正好 2 层
-adb shell su -c 'ls /data/adb/modules/'
-```
-
-旧模块的 `state/`（原厂备份、运行日志）随删除一起消失，不影响使用 ——
-新模块开机时会重新从设备上现读原厂 XML 再备份一次。
-升级源码时也别忘了同步 `lhdc.conf` 里的自定义项。
-
 ---
 
 ## 许可证
 
 **GNU General Public License v3.0**（全文见 [LICENSE](LICENSE)）。
-
-自己用没有任何限制：刷进自己的设备、照 `lhdc.conf` 改参数、随意二次分发都可以。
-约束只在**分发衍生作品**时生效 —— 需要同样以 GPL-3.0 开源，并保留版权声明。
-
-之所以用 GPL 而不是更宽松的许可证，是因为这个模块真正的价值不在代码长度
-（核心 `lib/patch_policy.awk` 五百来行），而在**踩出来的那几条结论**：
-A2DP 端口为什么必须挂到 `bluetooth` module 下、列表分隔符为什么只能逐台探测、
-`sku` 为什么不能按平台名推断。这些是拿两台设备、多轮冷启动换来的经验，
-GPL 能保证它们继续回流，而不是被闭源吃掉。
 
 > 本模块在运行时以 bind mount 覆盖系统配置，**不改写任何分区上的原始文件**，
 > 卸载后设备即恢复原状。许可证覆盖的是本仓库的代码与文档。
