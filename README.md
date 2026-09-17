@@ -2,7 +2,8 @@
 
 > **模块 ID / 仓库名**：`android17-lhdc-a2dp-universal`
 > 2026-09-18 更名，**曾用名 `lhdc-a2dp-universal`**。代码逐字节未动，只换了标识；
-> 但**换 ID 等于换模块** —— 设备上必须先卸旧的再装新的（见「从旧 ID 迁移」）。
+> 但**换 ID 等于换模块** —— 设备上必须先卸旧的、再装新的，然后重启；
+> 否则同一个策略文件上会叠出 4 层 overlay，而自检只看内容不看层数，会照样报 OK。
 
 让 **Android 17 的原生 LHDC** 真正出声的 Magisk / KernelSU / APatch 模块。
 
@@ -250,6 +251,24 @@ blob 里同时含 `taro` 和 `ukee` → **一次选中 `sku_taro` 和 `sku_ukee`
 
 **不适用**：编码器本身缺失的设备（`lhdc_codec_support=FALSE`，或 Android < 17）。
 **模块只负责把音频接到正确的 HAL 通路，它不提供编码器。**
+
+### MTK / 联发科平台能用吗
+
+基本不能 —— 但判据是上面的第 2、3 条，**不是「芯片是哪个厂」**：
+
+- MTK 设备的音频 HAL 是联发科自己的实现，**没有高通 PAL**，也不存在
+  `btaudio_offload_if.so` / QTI HIDL session。本模块要修的那条断链
+  （AOSP 蓝牙栈不去开 QTI session → 拿不到 encoder config）在 MTK 上根本不存在
+- 因此也不需要把 A2DP 端口挪进 `bluetooth` module：高通平台缺的是软件编码通路，
+  MTK 的 A2DP 走自家 HAL，挪过去反而可能没声
+- 少数 MTK 设备可能带 `audio.bluetooth.default.so`（AOSP 通用蓝牙音频 HAL，
+  多为 LE Audio / 助听器而打包），但这**不代表**它的 A2DP 走这条通路
+
+MTK 上「LHDC 协商成功却无声」通常是另一回事：厂商没在该机型开放 LHDC、蓝牙
+固件/中间件版本不匹配，或 MTK 自家 offload 的配置问题 —— 都不是本模块能解决的，
+得去找该机型的 ROM 或内核侧方案。
+
+> 拿不准就跑 `--dry-run`：它只报告不改东西，看 SDK、HAL、候选策略文件三节就能定性。
 
 Root 侧无门槛：Magisk / KernelSU / APatch 都行（只用 `post-fs-data.sh` + `service.sh`，
 **不用 `system/` 目录覆盖** —— KernelSU 原生不支持）。
