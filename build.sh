@@ -112,6 +112,10 @@ is_excluded() {
     case "$1" in
         build.sh|.gitignore|.gitattributes) return 0 ;;
         .git/*|.git)                        return 0 ;;
+        # 英文文档：面向 GitHub 上的读者，设备侧没人会去读，进包只会平白增大体积、
+        # 并让包 sha256 与已发布的 Release 附件对不上（README.md 是进包的，它一改
+        # 包的哈希就变；多语言版本不该再叠加这个影响）。
+        README.en.md)                       return 0 ;;
         # CI 配置：Release 由 GitHub Actions 构建，workflow 本身是仓库工程文件，
         # 与「装到设备上的模块」无关。它必须被排除，否则 Actions 打出的包会比
         # 本地包多出 .github/ 一个条目 → sha256 对不上，可复现验证直接失效。
