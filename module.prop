@@ -1,6 +1,6 @@
 id=android17-lhdc-a2dp-universal
 name=LHDC A2DP Enabler (Android 17 universal)
-version=v2.1.1
-versionCode=20011
+version=v2.1.2
+versionCode=20012
 author=Makuro-Arisaka
 description=自动定位 audio_policy_configuration.xml，把 A2DP 输出端口迁进 bluetooth module 并声明 AUDIO_FORMAT_LHDC，让 Android 17 的原生 LHDC 真正出声。面向「LHDC 协商成功但完全无声」的 AOSP 蓝牙栈 + 高通音频 HAL 混合架构设备。
