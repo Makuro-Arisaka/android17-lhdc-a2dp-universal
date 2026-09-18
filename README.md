@@ -6,6 +6,8 @@
 
 本模块由`DeepSeekV4.1Flash`制作。
 
+> 英文版 / English version: [README.en.md](README.en.md)
+
 ---
 
 ## 它解决什么问题
@@ -504,7 +506,8 @@ android17-lhdc-a2dp-universal/
 │   ├── workflows/release.yml   推 v* 标签即自动构建 + 发版（**不进包**）
 │   └── RELEASE_TEMPLATE.md     Release 说明模板（**不进包**）
 ├── build.sh               打包脚本（**开发者用，不进包**）
-├── README.md              文档
+├── README.md              文档（中文）
+├── README.en.md           英文文档（**不进包**）
 ├── LICENSE                GPL-3.0 全文
 └── state/                 运行时生成，含备份与日志（**不进包**）
 ```
