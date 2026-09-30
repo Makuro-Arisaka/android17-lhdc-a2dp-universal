@@ -116,6 +116,9 @@ is_excluded() {
         # 并让包 sha256 与已发布的 Release 附件对不上（README.md 是进包的，它一改
         # 包的哈希就变；多语言版本不该再叠加这个影响）。
         README.en.md)                       return 0 ;;
+        # AGENTS.md：面向 AI 编码助手/贡献者的仓库说明，设备侧无用，进包只增大体积、
+        # 并扰动包 sha256。与 README.en.md、.github/ 同理，属仓库工程文件。
+        AGENTS.md)                          return 0 ;;
         # CI 配置：Release 由 GitHub Actions 构建，workflow 本身是仓库工程文件，
         # 与「装到设备上的模块」无关。它必须被排除，否则 Actions 打出的包会比
         # 本地包多出 .github/ 一个条目 → sha256 对不上，可复现验证直接失效。
