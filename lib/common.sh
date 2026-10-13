@@ -375,32 +375,88 @@ lc_raw_read() {
 }
 
 # 确保原厂备份存在且干净
+#
+# ⚠️ 为什么不能只判「非空 + 看着像原厂」就长期信任 golden：
+#    golden 存在 state/ 里，**跨 OTA / 重刷 vendor 存活**（只有重装模块时的
+#    customize.sh 会清掉）。若用户在刷了新 vendor 之后继续用模块，golden 仍是
+#    旧固件那份 —— 于是我们拿旧文件打补丁，再把它整个覆盖到新策略上，把新版
+#    vendor 新增/改动的端口与 profile 一并抹掉。症状是「升级后别的音频功能出问题」，
+#    极难归因到本模块。原先的判据完全看不出这种过期。
+#
+#    现在用**固件指纹**做闸门（真机实测 ro.vendor.build.fingerprint 可用）：
+#      指纹没变 → golden 直接可信，零额外开销（不必每次开机都直读分区）
+#      指纹变了 → 直读分区核对；一致就只更新指纹，不一致才重建
+#      没有指纹属性 → 退化为直读核对（多花约 100ms，真机实测）
+#      连直读都拿不到（无 busybox / 无权限）→ 保留旧判据并告警，不让模块整体失效
+lc_golden_write_fp() {
+    local side="$1" v
+    v=$(getprop ro.vendor.build.fingerprint 2>/dev/null)
+    [ -n "$v" ] && printf '%s\n' "$v" > "$side" 2>/dev/null
+    return 0
+}
+
 lc_ensure_golden() {
-    local src="$1" key golden
+    local src="$1" key golden side fpfile fp_now fp_old tmp_md5 part_md5 cur
     key=$(lc_key "$src")
     golden=$LHDC_STATE/golden/$key.xml
+    side=$LHDC_STATE/golden/$key.md5
+    fpfile=$LHDC_STATE/golden/$key.fp
     mkdir -p "$LHDC_STATE/golden" 2>/dev/null
 
-    if [ -s "$golden" ] && lc_is_stock "$golden"; then return 0; fi
+    fp_now=$(getprop ro.vendor.build.fingerprint 2>/dev/null)
+    fp_old=$(cat "$fpfile" 2>/dev/null)
 
-    if lc_is_stock "$src"; then
+    # 已有 golden：指纹未变即可信（这是最常见路径，零开销）
+    if [ -s "$golden" ] && lc_is_stock "$golden"; then
+        if [ -n "$fp_now" ] && [ "$fp_now" = "$fp_old" ]; then
+            # 顺手补边车（老版本装的没有）
+            if [ ! -s "$side" ]; then
+                md5sum "$golden" 2>/dev/null | cut -d' ' -f1 > "$side" 2>/dev/null
+            fi
+            return 0
+        fi
+        # 指纹变了、或没有指纹可比 → 直读分区核对
+        part_md5=""
+        tmp_md5=$LHDC_STATE/golden/.probe.$$
+        if lc_raw_read "$src" "$tmp_md5"; then
+            part_md5=$(md5sum "$tmp_md5" 2>/dev/null | cut -d' ' -f1)
+        fi
+        rm -f "$tmp_md5" 2>/dev/null
+        cur=$(md5sum "$golden" 2>/dev/null | cut -d' ' -f1)
+        if [ -n "$part_md5" ]; then
+            if [ "$cur" = "$part_md5" ]; then
+                printf '%s\n' "$cur" > "$side" 2>/dev/null
+                [ -n "$fp_now" ] && lc_golden_write_fp "$fpfile"
+                return 0
+            fi
+            lc_log "INFO: $key 的原厂备份与当前分区不一致（固件已更新）→ 重新直读"
+        else
+            # 拿不到分区现值：保留旧判据，但把实情说清楚
+            if [ -s "$side" ] && [ "$(cat "$side" 2>/dev/null)" != "$cur" ]; then
+                lc_log "WARN: $key 的原厂备份与其 md5 边车不匹配，且当前无法直读分区核对"
+            fi
+            return 0
+        fi
+    fi
+
+    # 重建：优先分区直读（最权威），拿不到再退回「可见文件即原厂」
+    if lc_raw_read "$src" "$golden"; then
+        lc_log "BACKUP: $key ← 分区原始文件 ($(wc -c < "$golden" 2>/dev/null) B)"
+    elif lc_is_stock "$src"; then
         # 同样先清空再写：cat 失败时不能留下上一次的旧内容冒充本次备份
         : > "$golden" 2>/dev/null
         cat "$src" > "$golden" 2>/dev/null
         lc_log "BACKUP: $key ← 当前可见原厂 ($(wc -c < "$golden" 2>/dev/null) B)"
     else
-        lc_log "INFO: $key 可见内容已是补丁态，改从分区原始文件直读"
-        if lc_raw_read "$src" "$golden"; then
-            lc_log "BACKUP: $key ← 分区原始文件 ($(wc -c < "$golden" 2>/dev/null) B)"
-        else
-            rm -f "$golden" 2>/dev/null
-            lc_log "ERROR: $key 取不到原厂配置 → 跳过（请先移除其它覆盖方案，或重刷 vendor）"
-            return 1
-        fi
+        rm -f "$golden" 2>/dev/null
+        lc_log "ERROR: $key 取不到原厂配置 → 跳过（请先移除其它覆盖方案，或重刷 vendor）"
+        return 1
     fi
 
     [ -s "$golden" ] || return 1
-    md5sum "$golden" 2>/dev/null | cut -d' ' -f1 > "$LHDC_STATE/golden/$key.md5"
+    # 边车与指纹：边车会被读取校验，指纹用于下次开机免直读
+    md5sum "$golden" 2>/dev/null | cut -d' ' -f1 > "$side"
+    lc_golden_write_fp "$fpfile"
     return 0
 }
 
