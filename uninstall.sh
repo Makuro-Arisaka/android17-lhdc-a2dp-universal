@@ -16,18 +16,55 @@ for dst in $(lc_find_candidates); do
     key=$(lc_key "$dst")
     golden=$LHDC_STATE/golden/$key.xml
     lc_unmount_dst "$dst"
+
+    # ── 第一步：我们的层到底摘掉了没有 ────────────────────────────────
+    # ⚠️ 必须先问这一句，再问「文件坏没坏」。
+    #    原先直接拿 lc_is_stock 判定，于是只要层没摘干净（audioserver 正持着
+    #    这个文件时 bind mount 会 EBUSY，lc_unmount_dst 会 break），
+    #    $dst 读到的仍是**我们自己的补丁层** → 看着不像原厂 → 被报成
+    #    「分区原文件不可用」，还劝用户去重刷 vendor。
+    #    那是拿一个「还没卸载完」的状态去指认分区损坏，属于误报。
+    if [ "$(lc_self_mode "$dst")" != "(无挂载)" ]; then
+        echo "  [!!] 未能摘除挂在 $dst 上的层（多半被 audioserver 占用）"
+        echo "       → 这**不是**分区文件损坏。重启后再卸载一次即可。"
+        continue
+    fi
+
+    # ── 第二步：分区文件本身是原厂吗 ──────────────────────────────────
     if lc_is_stock "$dst"; then
         echo "  [OK] 分区原文件完好：$dst"
-    else
-        echo "  [!!] 分区原文件不可用（$(wc -c < "$dst" 2>/dev/null) B）：$dst"
-        if [ -s "$golden" ]; then
-            if mount --bind "$golden" "$dst" 2>/dev/null; then
-                echo "       → 已用原厂备份临时兜住，重启前请先重刷 vendor"
-                bridged=1
-            fi
-        else
-            echo "       → 且没有可用的原厂备份，重启后该文件不可解析"
+        continue
+    fi
+
+    # ── 第三步：不是原厂，但也不等于坏了 ──────────────────────────────
+    # 两种「看着不像原厂但完全正常」的形态：
+    #   a) 文件本身就是目标形态（本机 ROM 自带 bluetooth module + LHDC，
+    #      或上一次装机留下的、没能摘掉的残留层刚刚已被摘掉）
+    #   b) 内容结构完整，只是带了别的模块/厂商改动
+    # 这两种都不该说成「损坏」—— 一旦这么说，用户就会去重刷 vendor，
+    # 而那个动作本身才是真的有风险。
+    if lc_is_patched "$dst"; then
+        echo "  [OK] 分区文件已是目标形态（ROM 自带或既有改动）：$dst"
+        continue
+    fi
+
+    sz=$(wc -c < "$dst" 2>/dev/null)
+    if [ -n "$sz" ] && [ "$sz" -ge 2000 ] 2>/dev/null \
+       && grep -q '</modules>' "$dst" 2>/dev/null; then
+        echo "  [??] 分区文件结构完整但非原厂形态，未作改动：$dst"
+        echo "       （$sz B；这不是损坏。若音频异常请对比原厂备份）"
+        continue
+    fi
+
+    # ── 第四步：确实不完整/不可解析 —— 这才叫损坏 ────────────────────
+    echo "  [!!] 分区原文件不完整或不可解析（${sz:-?} B）：$dst"
+    if [ -s "$golden" ]; then
+        if mount --bind "$golden" "$dst" 2>/dev/null; then
+            echo "       → 已用原厂备份临时兜住，重启前请先重刷 vendor"
+            bridged=1
         fi
+    else
+        echo "       → 且没有可用的原厂备份，重启后该文件不可解析"
     fi
 done
 

@@ -714,6 +714,52 @@ lc_gate() {
     return 0
 }
 
+# ---------------------------------------------------------------- 并发锁
+#
+# ★ 为什么需要：post-fs-data 与 service 都会调 lc_apply_all，而 README 还鼓励
+#   用户手动跑 `sh post-fs-data.sh` 诊断。两个实例撞在一起时：
+#     - tag 只保证**文件名**唯一，保不住下面那句 `rm -f work/*.xml` 的清扫
+#     - 若 A 在「cp golden→work」之后、mount 之前执行清扫，B 的挂载源就没了
+#       → B 报 BASE/TOP 挂载失败，随后又因为看到 A 的层而报 RESULT: OK
+#     - 两个实例还会并发写 golden
+#   结果是一堆自相矛盾的日志（FAIL 之后紧跟 OK），排查时极费神。
+#   参考实现：mkdir 是原子的 test-and-set，POSIX 与 busybox 都支持。
+#
+# ⚠️ 必须处理**陈旧锁**：进程被 kill / 掉电会留下锁目录，不清理就会永久卡住。
+#    判据用「锁里的 pid 还活着吗」——比按时间猜可靠，且开机后 pid 空间是新的。
+lc_lock_dir() { echo "$LHDC_STATE/.lock"; }
+
+lc_lock_acquire() {
+    local d pid i
+    d=$(lc_lock_dir)
+    mkdir -p "$LHDC_STATE" 2>/dev/null
+    i=0
+    while [ "$i" -lt 2 ]; do
+        if mkdir "$d" 2>/dev/null; then
+            echo $$ > "$d/pid" 2>/dev/null
+            return 0
+        fi
+        # 已有锁：看持锁者是否还活着
+        pid=$(cat "$d/pid" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            return 1                       # 确实有别的实例在跑
+        fi
+        # 持锁者已死（或锁里没有 pid）→ 陈旧锁，清掉重试一次
+        lc_log "INFO: 清除陈旧的 apply 锁（持有者 pid=${pid:-未知} 已不存在）"
+        rm -rf "$d" 2>/dev/null
+        i=$((i + 1))
+    done
+    return 1
+}
+
+lc_lock_release() {
+    local d
+    d=$(lc_lock_dir)
+    # 只释放自己的锁：避免把别人的锁删掉
+    [ "$(cat "$d/pid" 2>/dev/null)" = "$$" ] && rm -rf "$d" 2>/dev/null
+    return 0
+}
+
 lc_apply_all() {
     local dst key golden patched work tag
     local ok=0 fail=0
@@ -721,15 +767,27 @@ lc_apply_all() {
     lc_gate || return 1
     lc_fix_offload_prop
 
+    # 并发保护：拿不到锁就退让（另一个实例正在做同样的事，没必要重复）
+    if ! lc_lock_acquire; then
+        lc_log "INFO: 另一个 apply 正在进行（锁被占），本次跳过以免互相清扫挂载源"
+        return 0
+    fi
+
     local targets
-    targets=$(lc_pick_targets) || { lc_log "SKIP: 找不到可处理的 audio_policy_configuration.xml"; return 1; }
+    targets=$(lc_pick_targets) || { lc_log "SKIP: 找不到可处理的 audio_policy_configuration.xml"; lc_lock_release; return 1; }
 
     # 每次 apply 用唯一的 tag 命名挂载源，这样绝不会有"上一次留下的幽灵挂载"
     # 盖住这次要用的文件（同一个 boot 里 service 阶段可能再补做一次）。
     tag="$$.$(date +%s 2>/dev/null)"
     mkdir -p "$LHDC_STATE/patched" "$LHDC_STATE/work" 2>/dev/null
-    # 清掉历史副本；被幽灵挂载盖住的会删不掉（EBUSY），忽略即可 —— 下次开机会清成功
-    rm -f "$LHDC_STATE"/work/*.xml "$LHDC_STATE"/patched/*.xml 2>/dev/null
+
+    # 清掉历史副本。
+    # ⚠️ 通配要写成 *.xml*（带上尾随的 *）——lc_gen_patched 先写 "$out.tmp"
+    #    再 mv 成 "$out"，所以中途被杀会留下 `...xml.tmp`；而 `*.xml` **匹配不到**
+    #    它。那个残留只有一个来源（进程被杀，且它自己的清理跑不到），
+    #    于是会永久占着一份策略文件大小的空间，且谁都不会清。
+    #    被幽灵挂载盖住的删不掉（EBUSY），忽略即可 —— 下次开机会清成功。
+    rm -f "$LHDC_STATE"/work/*.xml* "$LHDC_STATE"/patched/*.xml* 2>/dev/null
 
     for dst in $targets; do
         key=$(lc_key "$dst")
@@ -754,6 +812,7 @@ lc_apply_all() {
     done
 
     lc_log "=== 汇总: 成功 $ok / 失败 $fail ==="
+    lc_lock_release
     [ "$ok" -gt 0 ]
 }
 
