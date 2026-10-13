@@ -319,7 +319,16 @@ lc_raw_read() {
     umount "$mnt" 2>/dev/null
     mount --bind "$root" "$mnt" 2>/dev/null || { umount "$mnt" 2>/dev/null; return 1; }
     rel=${src#"$root"}
-    [ -s "$mnt$rel" ] && cat "$mnt$rel" > "$dst" 2>/dev/null
+    # ⚠️ 先把 dst 清掉再读。若源文件读不到（不存在 / 为空 / bind 没生效），
+    #    下面的 if 会整段跳过，dst 就保持**调用前的旧内容**；而末尾只检查
+    #    「非空」，于是陈旧的旧备份会被当成本次读取成功。
+    #    后果比想象严重：lc_ensure_golden 会把这个陈旧文件当作「干净原厂备份」
+    #    收进 golden（因为 lc_is_stock 只查大小/结构，认不出它是过期内容），
+    #    之后所有打补丁与还原都基于一份错的原厂副本。
+    : > "$dst" 2>/dev/null
+    if [ -s "$mnt$rel" ]; then
+        cat "$mnt$rel" > "$dst" 2>/dev/null
+    fi
     umount "$mnt" 2>/dev/null
     [ -s "$dst" ] || return 1
     lc_is_patched "$dst" && return 1     # 没绕开，作废
@@ -336,6 +345,8 @@ lc_ensure_golden() {
     if [ -s "$golden" ] && lc_is_stock "$golden"; then return 0; fi
 
     if lc_is_stock "$src"; then
+        # 同样先清空再写：cat 失败时不能留下上一次的旧内容冒充本次备份
+        : > "$golden" 2>/dev/null
         cat "$src" > "$golden" 2>/dev/null
         lc_log "BACKUP: $key ← 当前可见原厂 ($(wc -c < "$golden" 2>/dev/null) B)"
     else
@@ -480,7 +491,11 @@ lc_self_mode() {
 lc_clear_ghost() {
     local src="$1" n=0
     [ -n "$src" ] || return 0
-    while [ "$n" -lt 8 ] && grep -q " $src " /proc/self/mountinfo 2>/dev/null; do
+    # ⚠️ 用 grep -F 字面匹配。路径里含 '.'（audio_policy_configuration.xml），
+    #    不加 -F 时点号会被当正则通配符，可能把没挂载的近似路径误判成已挂载
+    #    （实测：/vendor/etc/audio_policyXconfiguration.xml 会命中
+    #     " /vendor/etc/audio_policy.configuration.xml " 这个模式）。
+    while [ "$n" -lt 8 ] && grep -qF " $src " /proc/self/mountinfo 2>/dev/null; do
         if ! lc_make_private "$src"; then
             lc_log "WARN: 无法把 $src 置 private（缺 busybox），跳过幽灵挂载清理以免误伤补丁层"
             return 1
@@ -494,7 +509,7 @@ lc_clear_ghost() {
 
 lc_unmount_dst() {
     local dst="$1" n=0
-    while [ "$n" -lt 8 ] && grep -q " $dst " /proc/self/mountinfo 2>/dev/null; do
+    while [ "$n" -lt 8 ] && grep -qF " $dst " /proc/self/mountinfo 2>/dev/null; do
         # 能 private 就 private；不能也无妨 —— 从最顶层往下卸，卸载传播只会顺带
         # 清掉我们自己的幽灵副本，不会碰到别的层。
         lc_make_private "$dst"
