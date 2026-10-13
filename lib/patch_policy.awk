@@ -116,14 +116,18 @@ function rebody(t, pad,    base) {
 }
 # ------------------------------------------------------------------ XML 编辑
 
-# 探测这份 XML 里某个「列表型属性」的分隔符风格（"," 或 " "），探测不到返回 ""。
+# 按内容探测某个「列表型属性」的分隔符风格（"," 或 " "），探测不到返回 ""。
 #
-# ★ 为什么必须探测，不能写死
+# ⚠️ 这是**兜底**手段，不是首选。首选是根元素的 version 属性（见 sep_by_version）——
+#    因为 APM 的行为只由 version 决定，与我们写什么无关。
+#    本函数只在 version 读不到、或不是 1.0/7.0/7.1 时才被调用。
+#
+# ★ 为什么写错分隔符是灾难性的（两种方法都要防的失效模式）
 #   实测：同一个 AOSP 属性的分隔符风格**随 ROM 而变**——
-#     Redmi K20 Pro (Android 17)：samplingRates / channelMasks 用逗号，
-#                                  encodedFormats 用空格
-#     POCO F5      (Android 16)：全部用空格
-#   写死任何一种，换台机器就翻车。而**列表分隔符写错不会报任何错**：
+#     Redmi K20 Pro (Android 17, version=1.0)：samplingRates / channelMasks 用逗号
+#     realme GT5 Pro (Android 17, version=7.0)：全部用空格
+#     POCO F5       (Android 16)：全部用空格
+#   而**列表分隔符写错不会报任何错**：
 #   解析器只是把该 profile 悄悄降级成 "[dynamic rates]"（采样率表为空），
 #   随后 APM 在 openOutputWithProfileAndDevice() 里 "missing param" 返回失败，
 #   表现为 "checkOutputsForDevice(): No output available for device 0080" →
@@ -132,6 +136,9 @@ function rebody(t, pad,    base) {
 #
 #   判据：属性值里出现逗号 → 逗号风格；只出现空格（且无逗号）→ 空格风格。
 #   单值属性（无任何分隔符）两种都不计。
+#
+#   ⚠️ 本函数是纯文本扫描，**不跳过 XML 注释**。若某文件的注释里出现逗号，
+#      统计会被带偏。这正是它只能当兜底的原因之一。
 function detect_sep(t, prop,    k, a, b, v, nc, ns, rest) {
     nc = 0; ns = 0
     rest = t
@@ -151,7 +158,41 @@ function detect_sep(t, prop,    k, a, b, v, nc, ns, rest) {
     return ""
 }
 
+# 从根元素读 audioPolicyConfiguration 的 version 属性。读不到返回 ""。
+#
+# ★ 为什么要读它：APM 就是按这个属性决定分隔符的（见 sep_by_version），
+#   所以它是**权威来源**；按内容猜（detect_sep）只是它读不到时的兜底。
+function detect_root_version(t,    k, a, b) {
+    k = index(t, "<audioPolicyConfiguration")
+    if (k == 0) return ""
+    a = index(substr(t, k), "version=\"")
+    if (a == 0) return ""
+    a = k + a - 1 + length("version=\"")
+    b = index(substr(t, a), "\"")
+    if (b == 0) return ""
+    return substr(t, a, b - 1)
+}
+
+# version → samplingRates / channelMasks 的分隔符。
+# 规则抄自 AOSP（frameworks/av/services/audiopolicy/common/managerdefinitions/src/Serializer.cpp）：
+#     L251   std::string mSamplingRatesSeparator = ",";        // 默认
+#     L884   if (version == "7.0" || version == "7.1") {
+#     L885       mChannelMasksSeparator = mSamplingRatesSeparator = mFlagsSeparator = " ";
+#     L886   } else if (version != "1.0") {  → 报错，文件被拒
+# 返回 "" = 版本缺失或不是 1.0/7.0/7.1，调用方需回退到内容探测。
+function sep_by_version(v) {
+    if (v == "7.0" || v == "7.1") return " "
+    if (v == "1.0") return ","
+    return ""
+}
+
 # 给 encodedFormats 追加 AUDIO_FORMAT_LHDC（已存在则原样返回）
+#
+# ⚠️ 这里的分隔符固定是空格，不能跟随 samplingRates。
+#    AOSP 在 Serializer.cpp:568 对 encodedFormats 写死了 " "：
+#        encodedFormats = formatsFromString(encodedFormatsLiteral, " ");
+#    它**不**经过 version 判定那套（那只管 samplingRates / channelMasks / flags）。
+#    实测两台设备的 encodedFormats 也都是空格。
 function addlhdc(t,    k, a, b, v, e, sep) {
     sep = (ESEP != "" ? ESEP : " ")
     k = index(t, "encodedFormats=\"")
@@ -176,8 +217,8 @@ function addlhdc(t,    k, a, b, v, e, sep) {
 # 原厂 A2DP 端口常只声明 48000（那是给压缩 offload 用的）；改走 AOSP 软件编码后
 # 44.1kHz 耳机很常见，96kHz 也在 LHDC V5 能力范围内。
 #
-# ⚠️ 拼接时用的分隔符必须是 RSEP（从原厂文件探测来的），不能写死空格：
-#    在逗号风格的 ROM 上写空格会得到 "44100 48000,88200,96000" 这种混血列表，
+# ⚠️ 拼接时用的分隔符必须是 RSEP（由根元素 version 决定，见 sep_by_version），不能写死：
+#    在空格风格的 ROM 上写逗号（或反之）会得到 "44100,48000,88200 96000" 这种混血列表，
 #    解析器直接放弃 → profile 变 "[dynamic rates]" → A2DP 静默失效（见 detect_sep 注释）。
 function normrate(t,    k, a, b, v, out, rest, sep) {
     sep = (RSEP != "" ? RSEP : ",")
@@ -280,16 +321,31 @@ END {
     s = buf
     if (length(s) < 100) { print "ERR: input too small" > "/dev/stderr"; exit 1 }
 
-    # ---------- 0. 探测本文件的分隔符风格（决定我们生成的文本该怎么写）----------
-    # 采样率：跟随本文件；本文件没有多值采样率时退而参考 channelMasks；
-    # 再没有就用 AOSP 规范值逗号。
-    RSEP = detect_sep(s, "samplingRates")
-    if (RSEP == "") RSEP = detect_sep(s, "channelMasks")
-    if (RSEP == "") RSEP = ","
-    # encodedFormats：AOSP 规范是空格，而且两台实测设备都是空格；仍以探测为准。
-    ESEP = detect_sep(s, "encodedFormats")
-    if (ESEP == "") ESEP = " "
-    printf "INFO: separator samplingRates=[%s] encodedFormats=[%s]\n", RSEP, ESEP > "/dev/stderr"
+    # ---------- 0. 决定本文件的分隔符风格（决定我们生成的文本该怎么写）----------
+    # ★ 权威来源是根元素的 version 属性 —— APM 就是按它选分隔符的（见 sep_by_version）。
+    #   内容探测（detect_sep）只作为它读不到时的兜底。
+    #
+    #   为什么不能只靠内容探测：APM 的行为只由 version 决定，与我们写出的文本无关。
+    #   若某文件 version=7.0 而内容恰好用了逗号（或注释里出现逗号干扰探测），
+    #   内容探测会返回 ","，而 APM 仍按空格切 → 采样率表为空 → profile 变
+    #   "[dynamic rates]" → A2DP 打不开（详细症状见 detect_sep 注释）。
+    #   本 ROM（realme GT5 Pro / PixelOS 17）实测 version=7.0，两种方法都得到空格；
+    #   但 Redmi K20 Pro 是 version=1.0 + 内容逗号，两者一致才没暴露此缺陷。
+    RV = detect_root_version(s)
+    RSEP = sep_by_version(RV)
+    RSRC = "version=" RV
+    if (RSEP == "") {
+        # 版本缺失或非 1.0/7.0/7.1（后者本来就会被 APM 拒绝加载）→ 退回内容探测
+        RSEP = detect_sep(s, "samplingRates")
+        if (RSEP == "") RSEP = detect_sep(s, "channelMasks")
+        if (RSEP == "") RSEP = ","
+        RSRC = "探测(version 不可用)"
+    }
+    # encodedFormats：APM 写死用空格（Serializer.cpp:568），与 version 无关。
+    #   这里不再探测 —— 探测若遇到逗号会写出 APM 切不开的混血列表。
+    ESEP = " "
+    printf "INFO: separator samplingRates=[%s] (%s) encodedFormats=[%s] (AOSP 固定)\n", \
+           RSEP, RSRC, ESEP > "/dev/stderr"
 
     # ---------- 1. module 索引 ----------
     mc = 0; pos = 1

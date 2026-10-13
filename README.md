@@ -116,20 +116,45 @@ mount: bad /etc/fstab: No such file or directory
 
 > 第 3 条是最后的安全网：只要 audioserver 读到的是原厂配置，它一定会被纠正过来。
 
-### ⚠️ 列表分隔符必须跟随 ROM（v2.1.0 的关键修复）
+### ⚠️ 列表分隔符由根元素 `version` 决定（v2.1.0 的修复，v2.1.3 修正了判定依据）
 
 AOSP 的 `audio_policy_configuration.xml` 里，列表型属性用哪种分隔符**不是固定的**，随 ROM 而变：
 
-| 属性 | Redmi K20 Pro / raphael（Android 17） | Redmi Note 12 Turbo / marble（Android 17） |
-|---|---|---|
-| `samplingRates` | **逗号** `48000,96000` | 空格 `48000 96000` |
-| `channelMasks` | **逗号** | 空格 |
-| `encodedFormats` | 空格 | 空格 |
+| 属性 | Redmi K20 Pro / raphael | realme GT5 Pro / enzo | Redmi Note 12 Turbo / marble |
+|---|---|---|---|
+| 根元素 `version` | `1.0`（**据源码规则反推**，见下注） | `7.0`（实测） | `7.0`（实测） |
+| `samplingRates` | **逗号** `48000,96000` | 空格 `48000 96000` | 空格 `48000 96000` |
+| `channelMasks` | **逗号** | 空格 | 空格 |
+| `encodedFormats` | 空格 | 空格 | 空格 |
 
-> **分隔符风格跟 Android 版本没关系，别想按机型/版本推断** —— 上表两台**都是
-> Android 17 / SDK 37**，风格却完全相反。它取决于**那份原厂 XML 是谁写的**
-> （vendor 分支 / ROM 移植来源不同），所以只能**逐台探测**。
-> 这正是 `detect_sep()` 存在的理由。
+> 注：enzo 与 marble 两列是解包实测值。raphael 那列的 `version` 未直接采样，
+> 是**从「它用逗号」+ 上面的源码规则反推**得到的（逗号 ⇒ 只可能是 `1.0`）。
+> 若将来能取到 raphael 的原厂 XML，值得回头核对一次。
+
+> **分隔符风格跟 Android 版本没关系，别想按机型/版本推断** —— 上表三台**都是
+> Android 17 / SDK 37**，风格却不同。它取决于**那份原厂 XML 是谁写的**
+> （vendor 分支 / ROM 移植来源不同）。
+
+**判据（v2.1.3 起的权威依据）**：`samplingRates` / `channelMasks` 的分隔符由
+**根元素 `audioPolicyConfiguration` 的 `version` 属性**决定 —— 这是 APM 自己的规则，
+见 `frameworks/av/.../Serializer.cpp`：
+
+```cpp
+L251:  std::string mSamplingRatesSeparator = ",";                     // 默认
+L884:  if (version == "7.0" || version == "7.1") {
+L885:      mChannelMasksSeparator = mSamplingRatesSeparator = mFlagsSeparator = " ";
+L886:  } else if (version != "1.0") {  → 报错，文件被拒
+```
+
+即：**`7.0`/`7.1` → 空格，`1.0` → 逗号。**
+
+> ⚠️ 为什么不能只靠「探测原厂文件的写法」：APM 的行为**只由 `version` 决定**，
+> 和文件里实际写的是什么无关。若某 ROM 出现 `version=7.0` 而内容误用逗号，
+> 探测会学出错的分隔符，而 APM 仍按空格切 → 同样静默失效。
+> 所以 `version` 是**权威来源**，`detect_sep()` 只作为它读不到时的兜底。
+>
+> 另外 `encodedFormats` **不跟 `version` 走**：AOSP 对这一项写死了空格
+> （`Serializer.cpp:568`），所以补丁器恒定用空格拼接它。
 
 v2.0.x 的 `patch_policy.awk` 把空格**写死了**（照搬 marble 的写法），于是移植到 K20 Pro 之后：
 
@@ -156,12 +181,13 @@ I AS.AudioDeviceInventory: APM failed to make available A2DP device addr=… err
 
 **修法（两道）**：
 
-1. `patch_policy.awk` 里的 `detect_sep()` 先**探测原厂文件的分隔符风格**再照着生成
-   （探测不到则退回 AOSP 规范值：`samplingRates`/`channelMasks` 逗号、`encodedFormats` 空格）。
-   每次 patch 会在 stderr 留一行，可据此确认它学到了什么：
+1. `patch_policy.awk` 的 `sep_by_version()` 按根元素 `version` 决定分隔符
+   （`version` 缺失或不是 `1.0/7.0/7.1` 时，才退回 `detect_sep()` 的内容探测；
+   都拿不到才用 AOSP 规范值）。每次 patch 会在 stderr 留一行，可据此确认它用了什么：
 
    ```
-   INFO: separator samplingRates=[,] encodedFormats=[ ]
+   INFO: separator samplingRates=[ ] (version=7.0) encodedFormats=[ ] (AOSP 固定)
+   INFO: separator samplingRates=[,] (version=1.0) encodedFormats=[ ] (AOSP 固定)
    ```
 
 2. `lc_check_a2dp_profile()` 在 `service` 阶段**对账运行态转储**：`a2dp output` 段里
