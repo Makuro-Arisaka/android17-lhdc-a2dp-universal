@@ -37,6 +37,31 @@ if [ "$bridged" = 1 ]; then
     echo "    原厂备份位置：$LHDC_STATE/golden/  与  /sdcard/lhdc-a2dp-backup/"
 fi
 
+# ⚠️ 删 state 之前必须先把 raw 摘掉。
+#    $LHDC_STATE/raw 是 lc_raw_read() 用来 bind 分区根的**挂载点**。
+#    rm -rf **默认会递归进挂载点**（阻止它的是 -x/--one-file-system，我们没用，
+#    而且 toybox/busybox 的 rm 也未必支持），所以一旦 raw 还挂着，下面那句
+#    rm -rf 就会**删进 /vendor**（或 /odm、/system_ext），后果是分区被抹空。
+#
+#    这不是假想：lc_raw_read 在 mount 与 umount 之间若被强杀（Magisk 超时、
+#    OOM、掉电、用户手动 kill），raw 就会留在挂载状态；此后卸载模块即触发。
+#    正常路径上它总会先 umount 再返回，但那是**隐式**保证 ——
+#    显式兜这一下成本为零，出事却是灾难。
+lc_unmount_dst "$LHDC_STATE/raw" >/dev/null 2>&1
+umount "$LHDC_STATE/raw" 2>/dev/null
+
+# ⚠️ 兜底挂载还在时不要删 golden。
+#    bridged=1 意味着分区文件已损坏、我们刚用 golden 临时兜住。
+#    此时删掉 golden，用户按上面提示去 $LHDC_STATE/golden/ 会**找不到任何东西**，
+#    而 /sdcard 的导出只在 boot_completed 之后才做、很可能根本不存在；
+#    重启后兜底挂载消失、分区文件又确实损坏 → 就没有任何可恢复的副本了。
+if [ "$bridged" = 1 ]; then
+    echo ""
+    echo "state 未清理：分区文件仍靠原厂备份兜着，先把备份留给你。"
+    echo "  请重刷 vendor 后手动删除： rm -rf $LHDC_STATE"
+    exit 0
+fi
+
 rm -rf "$LHDC_STATE" 2>/dev/null
 echo "state 已清理。"
 exit 0

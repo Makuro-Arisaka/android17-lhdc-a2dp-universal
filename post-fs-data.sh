@@ -17,6 +17,15 @@ for a in "$@"; do
 done
 export VERBOSE
 
+# 先把 DRY_RUN 交给 common.sh —— 它是**写操作的唯一闸门**。
+# 只在下面设 LC_ECHO 是不够的：lc_report 会间接调到带写操作的函数
+# （lc_log 建目录/写日志、lc_learn_active 写 active.path、lc_pick_targets 删失效的
+#  active.path），dry-run 的「不改动任何东西」承诺要靠这个变量守住。
+if [ "$DRY" = 1 ]; then
+    DRY_RUN=1
+    export DRY_RUN
+fi
+
 . "$MODDIR/lib/common.sh"
 
 if [ "$DRY" = 1 ]; then

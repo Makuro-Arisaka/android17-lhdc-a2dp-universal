@@ -46,9 +46,19 @@ LC_ECHO=0
 [ "$VERBOSE" = 1 ] && LC_ECHO=1
 
 # ---------------------------------------------------------------- 基础工具
+# DRY_RUN：置 1 时所有**写操作**都必须跳过（post-fs-data.sh --dry-run）。
+# ⚠️ 为什么不只靠「不调用写函数」：--dry-run 走的是 lc_report，而 lc_report 会
+#    间接调到 lc_pick_targets / lc_learn_active 等，它们内部自带
+#    mkdir -p "$LHDC_STATE"、>> "$LHDC_LOG"、rm -f active.path 这类写操作。
+#    只靠"报告路径上别调写函数"是守不住的 —— 一旦以后有人给 lc_report 加一行
+#    查询，副作用就会悄悄回来。所以把闸门放在最底层的写原语上。
+DRY_RUN=${DRY_RUN:-0}
+
 lc_log() {
-    [ -d "$LHDC_STATE" ] || mkdir -p "$LHDC_STATE" 2>/dev/null
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LHDC_LOG" 2>/dev/null
+    if [ "$DRY_RUN" != 1 ]; then
+        [ -d "$LHDC_STATE" ] || mkdir -p "$LHDC_STATE" 2>/dev/null
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LHDC_LOG" 2>/dev/null
+    fi
     # ⚠️ verbose 回显必须走 **stderr**：lc_pick_targets / lc_find_candidates 等
     #    函数的返回值是走 stdout 的（调用方用 $(...) 捕获）。回显若走 stdout，
     #    开着 VERBOSE 时日志行会被当成目标路径混进 $targets，去挂一堆不存在的
@@ -206,7 +216,9 @@ lc_pick_targets() {
     if [ -s "$LHDC_STATE/active.path" ]; then
         first=$(head -1 "$LHDC_STATE/active.path")
         if [ -f "$first" ]; then echo "$first"; return 0; fi
-        rm -f "$LHDC_STATE/active.path" 2>/dev/null
+        # 失效的学习结果要清掉，免得每次开机都白查一遍。
+        # dry-run 下不写盘（它承诺「不改动任何东西」）。
+        [ "$DRY_RUN" = 1 ] || rm -f "$LHDC_STATE/active.path" 2>/dev/null
     fi
 
     # 2) 显式指定 SKU
@@ -787,7 +799,7 @@ lc_learn_active() {
     # 只接受我们候选列表里的路径，避免学到无关文件
     for p in $(lc_find_candidates); do
         if [ "$p" = "$found" ]; then
-            echo "$found" > "$LHDC_STATE/active.path"
+            [ "$DRY_RUN" = 1 ] || echo "$found" > "$LHDC_STATE/active.path"
             lc_log "LEARN: 活跃策略 = $found（下次开机直接用它）"
             return 0
         fi
