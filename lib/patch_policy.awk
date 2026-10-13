@@ -313,10 +313,30 @@ function has_attr_val(seg, attrname, val) {
 }
 
 # 就地修补 seg 里所有需要动的 <devicePort ...>（补 LHDC、补齐采样率）。
+# 这个 devicePort 是不是 A2DP 输出端口（只有它才该被改成 LHDC/蓝牙采样率）。
+#
+# ★ 真机踩到的坑（Redmi K20 Pro / raphael，2026-10-13）：
+#   bluetooth module 里除了 3 个 A2DP 端口，还可能有
+#       <devicePort tagName="BT Hearing Aid Out" type="AUDIO_DEVICE_OUT_HEARING_AID">
+#   助听器走的是 ASHA / LE Audio 通路，与 A2DP 无关：
+#     - 它的 encodedFormats 本来就只有 SBC/AAC，**不该**冒出 AUDIO_FORMAT_LHDC
+#     - 它的采样率是 16000/24000 这类语音档，**不该**被改写成 44100/48000/88200/96000
+#   早先 fix_ports_in() 与 needsfix() 都只按「是不是 devicePort」判定，
+#   于是把这个端口一起改了 —— 产出一个语义上错误的策略文件。
+#   实测：设备上 /vendor/etc/bluetooth_hearing_aid_audio_policy_configuration.xml
+#   确实存在并被 xi:include 进来，所以这条路径在真机上是**必现**的，不是理论风险。
+function is_a2dp_port(t) {
+    return index(t, "AUDIO_DEVICE_OUT_BLUETOOTH_A2DP") > 0
+}
+
+# 就地修补 seg 里所有需要动的 A2DP <devicePort>（补 LHDC、补齐采样率）。
 #
 # ★ 用在「端口已经在目标 module 里，但缺 LHDC / 采样率不全」的情形。
 #   原先只有 needsfix 触发的整块搬迁路径会补 LHDC，**已经躺在 bluetooth 下的
 #   端口反而被漏掉**——于是模块自检看着绿，那个端口却仍然没有 LHDC。
+#
+# ⚠️ 必须按 type 过滤（见 is_a2dp_port）：module 里可能同时有助听器等其它端口，
+#    对它们补 LHDC / 改采样率是错的。
 function fix_ports_in(seg,    out, pos, i, p, e, pe) {
     out = ""
     pos = 1
@@ -326,7 +346,7 @@ function fix_ports_in(seg,    out, pos, i, p, e, pe) {
         if (e < 0) break
         pe = substr(seg, p, e - p)
         out = out substr(seg, pos, p - pos)
-        if (needsfix(pe)) out = out addlhdc(normrate(pe))
+        if (is_a2dp_port(pe) && needsfix(pe)) out = out addlhdc(normrate(pe))
         else out = out pe
         pos = e
     }
