@@ -198,7 +198,7 @@ lc_sku_of() {
 
 # 选出要处理的目标（每行一个）
 lc_pick_targets() {
-    local all blob matched m2 p p2 sn n n2 val first tok
+    local all blob matched m2 vm p p2 sn n n2 val first tok
     all=$(lc_find_candidates)
     [ -n "$all" ] || return 1
 
@@ -210,10 +210,37 @@ lc_pick_targets() {
     fi
 
     # 2) 显式指定 SKU
+    #
+    # ⚠️ 分两段匹配。`case "$p" in */sku_"$SKU"/*` 是**精确**匹配（要求 sku_<SKU>
+    #    后面紧跟 `/`），所以它认不出 QTI 常见的变体目录 sku_<SKU>_cdp / _mtp / _qrd。
+    #    用户按真身名填了 SKU=pineapple、而目录叫 sku_pineapple_cdp 时会**全部落空**，
+    #    然后被下面的「回退自动判定」用弱线索接管 —— 结果对不对全看运气。
+    #    这里补一段词元级变体匹配（与第 3 步 lc_sku_hit 的哲学一致）：
+    #    先精确，精确无果再收变体；变体可能多个，那就全处理
+    #    （与第 6 步「无法判定就全处理」一致：宁可多补一个，也别漏掉真身）。
     if [ -n "$SKU" ]; then
+        m2=""; vm=""
         for p in $all; do
-            case "$p" in */sku_"$SKU"/*) echo "$p"; return 0 ;; esac
+            sn=$(lc_sku_of "$p")
+            [ -n "$sn" ] || continue
+            if [ "$sn" = "$SKU" ]; then
+                m2="${m2:+$m2 }$p"                       # 精确命中
+            elif lc_sku_hit "$sn" "$SKU"; then
+                vm="${vm:+$vm }$p"                       # 变体命中（按 _ 切词）
+            fi
         done
+        if [ -n "$m2" ]; then
+            n2=$(echo $m2 | wc -w)
+            [ "$n2" -gt 1 ] && lc_log "INFO: SKU=$SKU 精确命中 $n2 个候选，全部处理"
+            for p in $m2; do echo "$p"; done
+            return 0
+        fi
+        if [ -n "$vm" ]; then
+            n2=$(echo $vm | wc -w)
+            lc_log "INFO: SKU=$SKU 无精确匹配，按变体命中 $n2 个候选（sku_${SKU}_*）"
+            for p in $vm; do echo "$p"; done
+            return 0
+        fi
         lc_log "WARN: SKU=$SKU 未匹配到候选，回退自动判定"
     fi
 

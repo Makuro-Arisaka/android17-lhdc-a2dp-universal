@@ -422,10 +422,17 @@ su -c 'dumpsys media.audio_policy | grep -c AUDIO_FORMAT_LHDC'
 #    期望 >= 1（三个 A2DP 端口各一次，加上 profile 复制）
 
 # 0b. 同样关键、而且更隐蔽：a2dp output 的采样率有没有真的解析出来
-#     分隔符风格写错时这里会退化成 [dynamic rates]，而上面那条 LHDC 检查照样是绿的
+#     分隔符写错时这里会退化成 [dynamic rates]，而上面那条 LHDC 检查照样是绿的
 su -c 'dumpsys media.audio_policy' | grep -A5 '"a2dp output";'
 #    期望 "sampling rates: 44100, 48000, 88200, 96000"
-#    若为 "[dynamic rates]" → A2DP 输出打不开、蓝牙无声（见「列表分隔符必须跟随 ROM」）
+#    若为 "[dynamic rates]" → A2DP 输出打不开、蓝牙无声
+#
+#    ⚠️ 这里的分号不能省。dumpsys 里 "a2dp output" 会出现 4 次：
+#       1 次在 MixPorts 段，形如  2. "a2dp output"; role source
+#       3 次在 Routes 段，形如    Sources: "a2dp output"        （无分号）
+#     grep '"a2dp output";'（带分号）只命中 MixPorts 那一条 —— 那才是我们要看的
+#     （AudioPort::dump 的格式串是 '"%s"; '，AudioRoute::dump 的是 'Sources: "%s"'）。
+#     省掉分号会把 Routes 段一起抓进来，看不出采样率状态。
 
 # 1. 音频硬件模块：primary 下不应再有 A2DP 端口，它们应归到 bluetooth
 su -c 'dumpsys media.audio_policy | grep "Handle: "'
