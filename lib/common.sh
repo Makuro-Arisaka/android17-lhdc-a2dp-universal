@@ -341,6 +341,22 @@ lc_raw_read() {
     mkdir -p "$mnt" 2>/dev/null
     umount "$mnt" 2>/dev/null
     mount --bind "$root" "$mnt" 2>/dev/null || { umount "$mnt" 2>/dev/null; return 1; }
+    # ⚠️ 必须马上 make-private —— 这是 AGENTS.md 铁律 3 在**每一个** bind 点上的要求，
+    #    本函数原先漏了（全文件唯一一处）。
+    #    /vendor 实测是 shared peer group 成员（真机 Redmi K20 Pro：
+    #        /vendor ... shared:11 - erofs /dev/block/dm-1
+    #    ），所以这层 bind 一建立就加入了同一个 peer group；随后的裸 umount
+    #    会向该 group 传播一个 detach 事件 —— 与 v2.0.1 栽的是同一类事件，
+    #    最坏情况是把真正生效的补丁层一起顶掉（症状：dumpsys 里回到原厂内容、
+    #    LHDC 协商成功却无声）。
+    #    lc_clear_ghost() 正是为了这个才坚持「没 private 就不 umount」；
+    #    这里先前却直接裸 umount，属于自相矛盾。拿不到 private 就放弃本次直读
+    #    （调用方会退回「可见文件即原厂」的路径，或报错让用户先移除其它覆盖方案）。
+    if ! lc_make_private "$mnt"; then
+        lc_log "WARN: 无法把 $mnt 置 private（缺 busybox），放弃直读分区原文件以免误伤补丁层"
+        umount "$mnt" 2>/dev/null
+        return 1
+    fi
     rel=${src#"$root"}
     # ⚠️ 先把 dst 清掉再读。若源文件读不到（不存在 / 为空 / bind 没生效），
     #    下面的 if 会整段跳过，dst 就保持**调用前的旧内容**；而末尾只检查
@@ -847,7 +863,15 @@ lc_report() {
                     if ($i ~ /^master:/)        mode = "slave"
                     if ($i ~ /^propagate_from/) mode = "slave"
                 }
-                printf "  [%-7s] %s\n                  ← %s\n", mode, $5, (sep ? $(sep + 2) : "?")
+                # ⚠️ 绑定来源是第 4 列（root），不是分隔符后第 2 列（那是**源设备**，
+                #    例如 /dev/block/dm-45）。
+                #    mountinfo 的字段是：
+                #      id parent major:minor **root** mountpoint options [optional...] - fstype source superopts
+                #    对本模块的层，root 才是「从哪个文件 bind 过来的」
+                #    （真机实测：/adb/modules/.../state/work/vendor_etc.<tag>.xml）。
+                #    这一行原先打印 sep+2，于是诊断里显示的是块设备，答不出
+                #    「这层到底是哪份文件」，与 README 展示的样例也对不上。
+                printf "  [%-7s] %s\n                  ← %s\n", mode, $5, $4
             }'
     else
         echo "  (无)"
