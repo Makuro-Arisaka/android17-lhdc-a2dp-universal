@@ -77,7 +77,18 @@ lc_rotatelog() {
     return 0
 }
 
-lc_key() { echo "$1" | sed 's|^/||; s|/audio_policy_configuration\.xml$||; s|/|_|g'; }
+# 把绝对路径映射成一个「文件名安全」的键，用于 golden/ patched/ work/ 下的文件名。
+#
+# ⚠️ 这个映射必须是**单射**（不同路径绝不能得到同一个键）。
+#    早先直接 `s|/|_|g`，于是目录名里本来就有的下划线会被误当成分隔符：
+#        /vendor/etc/audio/sku_pineapple/x.xml   → vendor_etc_audio_sku_pineapple
+#        /vendor/etc/audio/sku/pineapple/x.xml   → vendor_etc_audio_sku_pineapple
+#    两条路径撞成同一个键，后果是 golden/<key>.xml 与 patched/<key>.*.xml
+#    **互相覆盖**：A 的原厂备份会被 B 覆盖，卸载时的体检与还原都会用错那一份 ——
+#    又是本仓库最怕的静默错误。
+#    修法：先把组件里原有的 `_` 转义成 `__`，再用单个 `_` 作分隔符。
+#    可逆（`__`→字面下划线，单个 `_`→分隔符），且不需要额外工具。
+lc_key() { echo "$1" | sed 's|^/||; s|/audio_policy_configuration\.xml$||; s|_|__|g; s|/|_|g'; }
 
 # 带超时执行命令。**凡是对外查询系统状态的地方都必须用它**：这套模块面对的设备
 # 可能因为别的故障长时间高负载（实测遇到过 load 57、`dumpsys` 几分钟不返回），
