@@ -351,6 +351,9 @@ lc_gen_patched() {
     $LHDC_AWK -f "$MODDIR/lib/patch_policy.awk" "$golden" > "$out.tmp" 2>"$LHDC_STATE/patch.err"
     rc=$?
     if [ "$rc" = 2 ]; then
+        # 本来就是目标形态：awk 已把原文打到 stdout，但我们改用原文件更稳妥
+        #（避免 awk 输出被任何过滤影响），并清掉临时文件免得在 state/ 里堆积。
+        rm -f "$out.tmp"
         cp -f "$golden" "$out" 2>/dev/null
         return 2
     fi
@@ -685,23 +688,41 @@ lc_ensure_running() {
 #   "APM failed to make available A2DP device"）→ 蓝牙彻底无声。
 #   全链路没有半条显式错误，而且本模块的 LHDC 声明检查照样全绿
 #   （因为 encodedFormats 是对的、只有 samplingRates 崩了），极易漏判。
-#   分隔符风格实测随 ROM 而变（K20 Pro 用逗号 / POCO F5 用空格），
-#   patch_policy.awk 会自动跟随原厂文件；这里是它的运行态对账。
+#   分隔符风格由根元素 version 决定（7.0/7.1 → 空格，1.0 → 逗号），
+#   patch_policy.awk 会据此生成；这里是它的运行态对账。
+#
+# ⚠️ 判定顺序很关键，写反了就会把失败态判成通过（假绿）。
+#   AudioProfile::dump 的格式串（libaudiofoundation.so 里可见）是：
+#       "%*ssampling rates: "     ← 前缀
+#       "[dynamic rates]"         ← 动态时的占位值
+#   即失败态打印为**同一行**的：
+#       sampling rates: [dynamic rates]
+#   所以必须先匹配 "[dynamic rates]"，再匹配 "sampling rates:"
+#   —— 否则 *"sampling rates:"* 会先命中，把失败态报成「已正确解析」。
 lc_check_a2dp_profile() {
-    local seg
+    local seg val
     [ -n "$1" ] || { lc_log "A2DP: 无转储，跳过采样率解析自检"; return 0; }
     # 只取「mixPorts 段里那个条目」——routes 段也有 Sources: "a2dp output"，别混进来
     seg=$(printf '%s\n' "$1" | awk '
         /^[ \t]*[0-9]+\. "a2dp output"/ { inb = 1 }
         inb { print; if (++n >= 10) exit }')
     case "$seg" in
-        *"sampling rates:"*)
-            lc_log "A2DP: a2dp output 采样率已正确解析 ✓"
-            return 0 ;;
         *"[dynamic rates]"*)
             lc_log "ERROR: a2dp output 的采样率解析失败（[dynamic rates]）→ A2DP 输出打不开、蓝牙无声"
-            lc_log "       原因：XML 列表分隔符风格与该 ROM 不符。看本次 patch 日志的 separator 行"
+            lc_log "       原因：XML 列表分隔符与该 ROM 的 version 规则不符。看本次 patch 日志的 separator 行"
             return 1 ;;
+    esac
+    case "$seg" in
+        *"sampling rates:"*)
+            # 还要确认冒号后面真有值 —— 空值同样是失效形态
+            val=$(printf '%s\n' "$seg" | sed -n 's/.*sampling rates:[ \t]*//p' | head -1 | tr -d ' \t')
+            case "$val" in
+                ""|"[dynamic rates]")
+                    lc_log "ERROR: a2dp output 的 sampling rates 为空（'$val'）→ A2DP 输出打不开、蓝牙无声"
+                    return 1 ;;
+            esac
+            lc_log "A2DP: a2dp output 采样率已正确解析 ✓ ($val)"
+            return 0 ;;
     esac
     lc_log "A2DP: 未能判定 a2dp output 采样率状态（未提取到该条目）"
     return 0

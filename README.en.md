@@ -101,18 +101,45 @@ Three lines of defence; if any one fails it does not fail silently:
 
 > #3 is the final safety net: as long as audioserver has read the stock config, it will be corrected.
 
-### ⚠️ List separators must follow the ROM (key fix in v2.1.0)
+### ⚠️ List separators are decided by the root element's `version` (fix in v2.1.0; predicate corrected in v2.1.3)
 
 In AOSP's `audio_policy_configuration.xml`, the separator used by list-valued attributes is **not fixed** — it varies by ROM:
 
-| Attribute | Redmi K20 Pro / raphael (Android 17) | Redmi Note 12 Turbo / marble (Android 17) |
-|---|---|---|
-| `samplingRates` | **comma** `48000,96000` | space `48000 96000` |
-| `channelMasks` | **comma** | space |
-| `encodedFormats` | space | space |
+| Attribute | Redmi K20 Pro / raphael | realme GT5 Pro / enzo | Redmi Note 12 Turbo / marble |
+|---|---|---|---|
+| root `version` | `1.0` (**inferred** from the rule below) | `7.0` (measured) | `7.0` (measured) |
+| `samplingRates` | **comma** `48000,96000` | space `48000 96000` | space `48000 96000` |
+| `channelMasks` | **comma** | space | space |
+| `encodedFormats` | space | space | space |
 
-> **The separator style has nothing to do with the Android version — do not try to infer it from device or version.** Both devices above are **Android 17 / SDK 37**, yet their styles are exactly opposite. It depends on **who wrote that stock XML** (different vendor branch / ROM porting source), so it can only be **detected per device**.
-> That is precisely why `detect_sep()` exists.
+> Note: the enzo and marble columns are measured from extracted images. The raphael `version`
+> was not sampled directly; it is **inferred** from "it uses commas" plus the rule below
+> (commas ⇒ it can only be `1.0`). Worth re-checking if a raphael stock XML ever becomes available.
+
+> **The separator style has nothing to do with the Android version — do not try to infer it from device or version.** All devices above are **Android 17 / SDK 37**, yet their styles differ. It depends on **who wrote that stock XML** (different vendor branch / ROM porting source).
+
+**The authoritative predicate (since v2.1.3)**: the separator for `samplingRates` / `channelMasks`
+is decided by the **root element's `version` attribute** — that is APM's own rule, in
+`frameworks/av/.../Serializer.cpp`:
+
+```cpp
+L251:  std::string mSamplingRatesSeparator = ",";                     // default
+L884:  if (version == "7.0" || version == "7.1") {
+L885:      mChannelMasksSeparator = mSamplingRatesSeparator = mFlagsSeparator = " ";
+L886:  } else if (version != "1.0") {  → error, file rejected
+```
+
+i.e. **`7.0`/`7.1` → space, `1.0` → comma.**
+
+> ⚠️ Why probing the stock file's own style is not enough: APM's behaviour is decided
+> **only by `version`**, regardless of what the file actually contains. If a ROM has
+> `version=7.0` while its content mistakenly uses commas, probing learns the wrong
+> separator while APM still splits on spaces → same silent failure.
+> So `version` is the **authoritative source**; `detect_sep()` is only a fallback for
+> when it cannot be read.
+>
+> Also, `encodedFormats` does **not** follow `version`: AOSP hardcodes a space for it
+> (`Serializer.cpp:568`), so the patcher always joins it with spaces.
 
 v2.0.x's `patch_policy.awk` **hardcoded** spaces (copied from marble's style), so after porting to the K20 Pro it produced:
 
@@ -137,16 +164,69 @@ And the module's own LHDC check **stays green** — because `encodedFormats` is 
 
 **The fix (two layers)**:
 
-1. `detect_sep()` in `patch_policy.awk` first **probes the separator style of the stock file** and then generates accordingly
-   (if detection fails it falls back to the AOSP canonical values: comma for `samplingRates`/`channelMasks`, space for `encodedFormats`).
-   Every patch leaves one line on stderr so you can confirm what it learned:
+1. `sep_by_version()` in `patch_policy.awk` decides the separator from the root `version`
+   (falling back to `detect_sep()` content probing only when `version` is missing or is not
+   `1.0/7.0/7.1`; AOSP canonical values only if both fail).
+   Every patch leaves one line on stderr so you can confirm what it used:
 
    ```
-   INFO: separator samplingRates=[,] encodedFormats=[ ]
+   INFO: separator samplingRates=[ ] (version=7.0) encodedFormats=[ ] (AOSP 固定)
+   INFO: separator samplingRates=[,] (version=1.0) encodedFormats=[ ] (AOSP 固定)
+   INFO: separator samplingRates=[ ] (探测(version 不可用)) encodedFormats=[ ] (AOSP 固定)
    ```
 
-2. `lc_check_a2dp_profile()` **reconciles against the runtime dump** in the `service` stage: the `a2dp output` section must contain `sampling rates:`; if it shows `[dynamic rates]` it raises `ERROR`.
-   (v2.1.0 had no such self-check, which is why the problem stayed hidden for so long.)
+2. `lc_check_a2dp_profile()` **reconciles against the runtime dump** in the `service` stage:
+   the `a2dp output` section must show real `sampling rates:` values.
+   `AudioProfile::dump` prints the failing form as `sampling rates: [dynamic rates]`
+   — on one line — so the check tests for `[dynamic rates]` **first** and only then for
+   `sampling rates:`, and additionally rejects an empty value list.
+   (v2.1.0 had no such self-check, which is why the problem stayed hidden for so long;
+   the pre-v2.1.4 ordering also mis-reported the failing form as OK.)
+
+   > ⚠️ That self-check was itself a false-green. `AudioProfile::dump` prints the failing
+   > form on **one line**: `sampling rates: [dynamic rates]` (both format strings,
+   > `"%*ssampling rates: "` and `"[dynamic rates]"`, live in `libaudiofoundation.so`).
+   > The earlier predicate tested `*"sampling rates:"*` first, so the **failing form matched
+   > it** and was reported as "parsed correctly ✓" — one of the roots of the "self-check
+   > stays green" symptom this document keeps mentioning.
+
+### ⚠️ The "already in target form" predicate must not look at devicePort alone (key fix in v2.1.4)
+
+`patch_policy.awk` uses exit code 2 for "already in target form, nothing to do". The earlier
+predicate **only looked at the A2DP devicePorts** (are they all under the `bluetooth` module,
+do they all declare LHDC), so this half-finished shape was judged "nothing to do":
+
+```xml
+<!-- ports complete, LHDC declared, but no a2dp output outlet at all -->
+<module name="bluetooth" halVersion="2.0">
+    <devicePorts>
+        <devicePort tagName="BT A2DP Out" ... encodedFormats="... AUDIO_FORMAT_LHDC">…</devicePort>
+        <devicePort tagName="BT A2DP Headphones" .../>…
+    </devicePorts>
+    <!-- no <mixPort name="a2dp output">, no <routes> -->
+</module>
+```
+
+In that shape the A2DP output **still cannot be opened and is still silent**, yet the script
+declared "nothing to do" and exited.
+
+Since v2.1.4 the predicate requires **all three**:
+
+1. every A2DP devicePort lives under the `bluetooth` module
+2. every port declares `AUDIO_FORMAT_LHDC` (with a complete sample-rate list)
+3. the `a2dp output` mixPort **exists**, and every port has a route pointing at it
+
+Three related oversights were fixed alongside it (each produced malformed XML or missed a patch):
+
+| Scenario | Symptom |
+|---|---|
+| Some ports already under `bluetooth`, some still under `primary` | ports already inside the module were **inserted a second time** |
+| `bluetooth` module comes from `xi:include`, and the file also declares the same ports under primary | devicePort and route each **duplicated**, `a2dp output` could duplicate too |
+| Port already under `bluetooth` but **missing LHDC** | LHDC was only added on the "bulk move" path, so in-module ports were **missed** |
+
+In addition, `normrate()` now **rebuilds the whole list**: split by token → dedupe → add the
+canonical sample rates → rejoin with this ROM's separator. That also rescues pathological ROMs
+whose own file mixes both separators.
 
 ### ⚠️ sku detection must be tiered: the platform name is not the sku name (key fix in v2.1.1)
 

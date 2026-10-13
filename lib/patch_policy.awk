@@ -162,15 +162,24 @@ function detect_sep(t, prop,    k, a, b, v, nc, ns, rest) {
 #
 # ★ 为什么要读它：APM 就是按这个属性决定分隔符的（见 sep_by_version），
 #   所以它是**权威来源**；按内容猜（detect_sep）只是它读不到时的兜底。
-function detect_root_version(t,    k, a, b) {
+#
+# ⚠️ 搜索必须**限定在根元素标签内**（到第一个 '>' 为止）。
+#    早先的写法是从 "<audioPolicyConfiguration" 起无条件往后找 version="
+#    —— 根元素没写 version 时它会一路往后扫，撞上注释或子元素里的
+#    version="..."（实测：注释里放 version="1.0" 就能把它骗出错误的逗号判定），
+#    而那正是本函数要防的那类静默失效。
+function detect_root_version(t,    k, gt, seg, a, b) {
     k = index(t, "<audioPolicyConfiguration")
     if (k == 0) return ""
-    a = index(substr(t, k), "version=\"")
+    gt = index(substr(t, k), ">")
+    if (gt == 0) return ""
+    seg = substr(t, k, gt)              # 仅根元素标签本身，不含后续内容
+    a = index(seg, "version=\"")
     if (a == 0) return ""
-    a = k + a - 1 + length("version=\"")
-    b = index(substr(t, a), "\"")
+    a = a + length("version=\"")
+    b = index(substr(seg, a), "\"")
     if (b == 0) return ""
-    return substr(t, a, b - 1)
+    return substr(seg, a, b - 1)
 }
 
 # version → samplingRates / channelMasks 的分隔符。
@@ -220,8 +229,23 @@ function addlhdc(t,    k, a, b, v, e, sep) {
 # ⚠️ 拼接时用的分隔符必须是 RSEP（由根元素 version 决定，见 sep_by_version），不能写死：
 #    在空格风格的 ROM 上写逗号（或反之）会得到 "44100,48000,88200 96000" 这种混血列表，
 #    解析器直接放弃 → profile 变 "[dynamic rates]" → A2DP 静默失效（见 detect_sep 注释）。
-function normrate(t,    k, a, b, v, out, rest, sep) {
+#
+# ⚠️ 两个必须处理的边界（都踩过）：
+#   1) v 为空串时不能直接 "44100" sep v —— 会拼出 "44100 " 这种带尾随分隔符的
+#      半成品，后续再追加就变成 "44100  88200 96000"（双分隔符）甚至丢掉原有的 48000。
+#      空串要特殊处理：整串重建为标准集合。
+#   2) 判存在性要用**词元级**比较，不能用 index(v,"48000") 这种子串判断 ——
+#      否则 "148000" 会被误认为已含 48000，漏补。
+#
+# ⚠️ seen 必须走**参数位**声明为局部数组（awk 的惯例），不能用 delete 清空：
+#    `delete arr`（整数组）是 GNU 扩展，POSIX awk / toybox awk / busybox awk 都不保证支持；
+#    而 seen 若是全局数组，跨多次调用会残留上一次的词元，导致漏补。
+#    （seen 在一次调用内跨 while 迭代复用是安全的：每个 profile 的采样率集合
+#      都要补成同一套标准值，累积不会造成错误结果。）
+function normrate(t,    k, a, b, v, out, rest, sep, i, arr, n2, nt, targets, seen, res, tok) {
     sep = (RSEP != "" ? RSEP : ",")
+    # 目标集合：AOSP 蓝牙 HAL 的标准采样率（顺序即输出顺序）
+    nt = split("44100 48000 88200 96000", targets, " ")
     out = ""
     rest = t
     while ((k = index(rest, "samplingRates=\"")) > 0) {
@@ -229,9 +253,31 @@ function normrate(t,    k, a, b, v, out, rest, sep) {
         b = index(substr(rest, a), "\"")
         if (b == 0) break
         v = substr(rest, a, b - 1)
-        if (index(v, "44100") == 0) v = "44100" sep v
-        if (index(v, "88200") == 0) v = v sep "88200"
-        if (index(v, "96000") == 0) v = v sep "96000"
+
+        # 整表重建：保留原有词元（顺序不变、去重），再按标准顺序补缺失项，
+        # 全部用 RSEP 连接。这样同时解决三件事：
+        #   ① 空列表 → 直接铺满标准集合（不会留下多余/重复分隔符）
+        #   ② 缺项 → 补上，且判存在性是**词元级**（"148000" 不会被当成 48000）
+        #   ③ 原文件本身混用了两种分隔符 → 一并归一化成 RSEP
+        #      （version 与内容风格不一致的病态 ROM 也能救回来）
+        res = ""
+        n2 = split(v, arr, "[, \t]+")
+        for (i = 1; i <= n2; i++) {
+            tok = arr[i]
+            if (tok == "" || (tok in seen)) continue
+            seen[tok] = 1
+            res = (res == "" ? tok : res sep tok)
+        }
+        for (i = 1; i <= nt; i++) {
+            tok = targets[i]
+            if (tok in seen) continue
+            seen[tok] = 1
+            # 44100 是最低采样率，AOSP 习惯放首位；其余按标准顺序追加到尾部
+            if (i == 1 && res != "") res = tok sep res
+            else res = (res == "" ? tok : res sep tok)
+        }
+        v = res
+
         out = out substr(rest, 1, a - 1) v
         rest = substr(rest, a + b - 1)
     }
@@ -251,6 +297,40 @@ function needsfix(t,    k, a, b, v, rest) {
         rest = substr(rest, a + b - 1)
     }
     return 0
+}
+
+# 目标 module 里是否已经有属性 attrname="val" 的标签。
+#
+# ★ 为什么必须查：搬迁时我们是把「本文件里不在 bluetooth 下的 A2DP 端口」整批
+#   插进目标 module。但目标 module 里可能**已经有同名端口**，两种来路：
+#     - 本文件里已有 bluetooth module，且它自己也声明了同名端口（部分搬迁的 ROM）
+#     - bluetooth module 来自被 include 的文件，而本文件 primary 下又重复声明了一份
+#   不做这个检查就会在同一个 module 里插出**重复的 devicePort / route**。
+#   同名端口重复属于未定义行为：routes 的 sink 指向歧义，解析结果不可预期。
+function has_attr_val(seg, attrname, val) {
+    if (seg == "" || val == "") return 0
+    return index(seg, attrname "=\"" val "\"") > 0
+}
+
+# 就地修补 seg 里所有需要动的 <devicePort ...>（补 LHDC、补齐采样率）。
+#
+# ★ 用在「端口已经在目标 module 里，但缺 LHDC / 采样率不全」的情形。
+#   原先只有 needsfix 触发的整块搬迁路径会补 LHDC，**已经躺在 bluetooth 下的
+#   端口反而被漏掉**——于是模块自检看着绿，那个端口却仍然没有 LHDC。
+function fix_ports_in(seg,    out, pos, i, p, e, pe) {
+    out = ""
+    pos = 1
+    while ((i = index(substr(seg, pos), "<devicePort ")) > 0) {
+        p = pos + i - 1
+        e = elemend(seg, p, "devicePort")
+        if (e < 0) break
+        pe = substr(seg, p, e - p)
+        out = out substr(seg, pos, p - pos)
+        if (needsfix(pe)) out = out addlhdc(normrate(pe))
+        else out = out pe
+        pos = e
+    }
+    return out substr(seg, pos)
 }
 
 # 取出字符串 t 中名为 name 的 module 的"内部正文"
@@ -390,23 +470,17 @@ END {
         if (pm[k] != "bluetooth") needmove = 1
         if (needsfix(px[k])) needlhdc = 1
     }
-    if (!needmove && !needlhdc) { printf "%s", s; exit 2 }
 
-    # ---------- 3a. 情形一：端口已在 bluetooth module 下 → 只补 LHDC/采样率 ----------
-    if (!needmove) {
-        ne = 0
-        for (k = 1; k <= pc; k++) {
-            if (needsfix(px[k])) {
-                ne++
-                es[ne] = ps[k]; ee[ne] = pe[k]; ex[ne] = addlhdc(normrate(px[k]))
-            }
-        }
-        emit(s, ne)
-        exit 0
-    }
-
-    # ---------- 3b. 需要搬迁 ----------
-    # 判断 bluetooth module 是否来自被 include 的文件（情形二）
+    # ★ 「已经是目标形态」的判据不能只看 devicePort。
+    #   光把端口摆进 bluetooth 是不够的 —— 软件编码通路还需要
+    #     ① 该 module 里有 mixPort "a2dp output"（APM 靠它开输出）
+    #     ② 每个 A2DP 端口都有 route 指向它
+    #   少任何一样，A2DP 输出都打不开（症状仍是无声）。
+    #   早先的判据只看 devicePort，于是「端口齐、LHDC 齐，但没有 a2dp output」
+    #   这种半成品会被判成「无需改动」而直接 exit 2，模块自检也看不出问题
+    #   —— 属于典型的假绿。
+    #
+    #   要判断目标 module 里已有什么，得先把它定位出来，所以下面先做定位。
     bthref = ""; inchtxt = ""; xipos = 0; xiend = 0
     if (bt == 0) find_bt_include()
 
@@ -424,6 +498,46 @@ END {
         }
     }
 
+    # 目标 module 现有的正文 —— 用来判断「它是不是已经有这个端口 / route / mixPort」。
+    #   bt > 0      ：目标就是本文件里那个 bluetooth module
+    #   bthref != ""：目标来自被 include 的文件
+    #   两者都没有  ：目标将由我们新建，现有内容视作空
+    tgtbody = ""
+    if (bt > 0) tgtbody = substr(s, ms[bt], me[bt] - ms[bt])
+    else if (bthref != "") tgtbody = modbody(inchtxt, "bluetooth")
+
+    needout = 0
+    if (tgtbody == "") {
+        needout = 1                                  # 目标都不存在，出口自然缺
+    } else {
+        if (index(tgtbody, "name=\"a2dp output\"") == 0) needout = 1
+        # 已在目标 module 里的端口，若没有 route 指向 a2dp output 也算缺
+        for (k = 1; k <= pc; k++)
+            if (pm[k] == "bluetooth" && !has_attr_val(tgtbody, "sink", pn[k])) needout = 1
+        # 目标 module 里已有端口但没有 a2dp output 时上面已置 1；
+        # 另有「端口在 primary、要搬进来」的情形由 needmove 覆盖。
+    }
+
+    if (!needmove && !needlhdc && !needout) { printf "%s", s; exit 2 }
+
+    # ---------- 3a. 情形一：端口已在 bluetooth module 下，且出口齐备
+    #            → 只需就地补 LHDC / 采样率 ----------
+    # 注意 needout 为真时**不能**走这条捷径：那条路只补 devicePort，
+    # 不会补 a2dp output mixPort 与 route。
+    if (!needmove && !needout) {
+        ne = 0
+        for (k = 1; k <= pc; k++) {
+            if (needsfix(px[k])) {
+                ne++
+                es[ne] = ps[k]; ee[ne] = pe[k]; ex[ne] = addlhdc(normrate(px[k]))
+            }
+        }
+        emit(s, ne)
+        exit 0
+    }
+
+    # ---------- 3b. 需要搬迁 / 或需补出口 ----------
+
     # 目标缩进：新增 module 对齐本文件已有 <module> 的写法；
     # 并入已有 module 时对齐那个 module 自己的写法。
     mind = indent_of(s, ms[1])
@@ -431,12 +545,26 @@ END {
     if (bt > 0) {
         q = index(substr(s, ms[bt], me[bt] - ms[bt]), "<mixPorts>")
         if (q > 0) mi = indent_of(substr(s, ms[bt], me[bt] - ms[bt]), q)
+    } else if (tgtbody != "") {
+        q = index(tgtbody, "<mixPorts>")
+        if (q > 0) mi = indent_of(tgtbody, q)
     }
 
     # 新的 devicePort 文本（补 LHDC、补齐采样率、重新缩进）
+    #
+    # ⚠️ 必须跳过**目标 module 里已经有**的同名端口。不做这个检查就会在同一个
+    #    module 内插出重复的 devicePort。重复可能来自两种来路：
+    #      - 本文件里已有 bluetooth module，且它自己也声明了同名端口（部分搬迁的 ROM）
+    #      - bluetooth module 来自被 include 的文件，而本文件 primary 下又声明了一份
+    #    AOSP 解析器对同名 devicePort 的行为未定义，routes 的 sink 也会指向歧义。
+    #
+    # ⚠️ 已经躺在目标 module 里、但缺 LHDC / 采样率不全的端口，由下面的
+    #    「就地修补」处理（情形一之变体 / 情形二），不在这里重复拼装。
     np = ""
     for (k = 1; k <= pc; k++) {
-        if (k > 1) np = np "\n"
+        if (pm[k] == "bluetooth") continue
+        if (has_attr_val(tgtbody, "tagName", pn[k])) continue
+        if (np != "") np = np "\n"
         np = np nlre(addlhdc(normrate(px[k])), mi "    ", indent_of(s, ps[k]))
     }
 
@@ -464,9 +592,13 @@ END {
         pos = e
     }
 
+    # 要补的 route：**所有**缺 route 的 A2DP 端口，不论它现在挂在哪个 module。
+    #   - 从 primary 搬进来的端口：需要新建 route
+    #   - 已经在 bluetooth 里但没有 route 的端口：同样需要补（否则输出打不开）
+    #   判据是 tgtbody 里有没有 sink 指向它，而不是它当前的 module。
     nrt = ""
     for (k = 1; k <= pc; k++) {
-        if (pm[k] == "bluetooth") continue
+        if (has_attr_val(tgtbody, "sink", pn[k])) continue
         if (nrt != "") nrt = nrt "\n"
         nrt = nrt mi "    <route type=\"mix\" sink=\"" pn[k] "\" sources=\"a2dp output\"/>"
     }
@@ -486,10 +618,24 @@ END {
         cmp = index(bseg, "</mixPorts>")
         havemix = index(bseg, "name=\"a2dp output\"") > 0
 
+        # ★ 已经躺在 bluetooth module 里、但缺 LHDC / 采样率不全的端口要**就地补**。
+        #   原先只有 needsfix 触发的整块搬迁路径才会补 LHDC，已在模块内的端口被漏掉，
+        #   结果是「有端口、没 LHDC」—— 而模块自检只看 bluetooth module 是否存在
+        #   与 a2dp output 是否解析出采样率，于是这种漏补不会被发现。
+        for (k = 1; k <= pc; k++) {
+            if (pm[k] != "bluetooth") continue
+            if (!needsfix(px[k])) continue
+            ne++
+            es[ne] = ps[k]; ee[ne] = pe[k]; ex[ne] = addlhdc(normrate(px[k]))
+        }
+
         okd = 0; okr = 0; okm = 0
         if (havemix) okm = 1
-        if (cdp > 0) { if (insbefore(bs + cdp - 1, np, mi)) okd = 1 }
-        if (cdr > 0) { if (insbefore(bs + cdr - 1, nrt, mi)) okr = 1 }
+        # np/nrt 为空时不要调 insbefore —— 它会在收尾标签前留下一个空行。
+        # 为空的情况是真实存在的：目标 module 里已经有全部同名端口/route
+        # （去重后没有要插的），此时只需删掉 primary 下的副本。
+        if (np != "" && cdp > 0) { if (insbefore(bs + cdp - 1, np, mi)) okd = 1 } else if (np == "") okd = 1
+        if (nrt != "" && cdr > 0) { if (insbefore(bs + cdr - 1, nrt, mi)) okr = 1 } else if (nrt == "") okr = 1
         if (!havemix) { if (cmp > 0) { if (insbefore(bs + cmp - 1, MIXPORT, mi)) okm = 1 } }
 
         if (!okd || !okr || !okm) {
@@ -507,17 +653,33 @@ END {
         if (hb == "") { print "ERR: cannot extract bluetooth module body from " bthref > "/dev/stderr"; exit 1 }
         hb = rebody(hb, mi)
 
-        q = insert_before_close(hb, "</mixPorts>", MIXPORT)
-        if (q != "") hb = q
-        else hb = hb "\n" mi "<mixPorts>\n" MIXPORT "\n" mi "</mixPorts>"
+        # ★ 被吸收进来的模块自己可能已经声明了 A2DP 端口（AOSP 官方的
+        #   bluetooth_audio_policy_configuration.xml 就是如此）。那些端口同样
+        #   需要补 LHDC / 采样率；而 np/nrt 只负责**本文件里**要搬进来的端口
+        #   （且已按 tgtbody 去重），两者互不重叠。
+        hb = fix_ports_in(hb)
 
-        q = insert_before_close(hb, "</devicePorts>", np)
-        if (q != "") hb = q
-        else hb = hb "\n" mi "<devicePorts>\n" np "\n" mi "</devicePorts>"
+        # ★ mixPort 同理：被吸收的模块若已经声明了 a2dp output，就不要再插一份
+        #   （重复的 mixPort name 会让 APM 建出两个同名输出，行为未定义）。
+        if (index(hb, "name=\"a2dp output\"") == 0) {
+            q = insert_before_close(hb, "</mixPorts>", MIXPORT)
+            if (q != "") hb = q
+            else hb = hb "\n" mi "<mixPorts>\n" MIXPORT "\n" mi "</mixPorts>"
+        }
 
-        q = insert_before_close(hb, "</routes>", nrt)
-        if (q != "") hb = q
-        else hb = hb "\n" mi "<routes>\n" nrt "\n" mi "</routes>"
+        # np / nrt 为空表示「要搬的端口在目标模块里都已存在」（去重后无剩余），
+        # 此时不该插入空段落。
+        if (np != "") {
+            q = insert_before_close(hb, "</devicePorts>", np)
+            if (q != "") hb = q
+            else hb = hb "\n" mi "<devicePorts>\n" np "\n" mi "</devicePorts>"
+        }
+
+        if (nrt != "") {
+            q = insert_before_close(hb, "</routes>", nrt)
+            if (q != "") hb = q
+            else hb = hb "\n" mi "<routes>\n" nrt "\n" mi "</routes>"
+        }
 
         # 删掉那个 xi:include，避免运行时出现两个同名 module
         ne++

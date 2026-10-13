@@ -17,16 +17,24 @@
 模块**不提供编码器，只做路由**。它**不改任何分区文件**——所有修改活在模块自己的
 `state/` 目录和内存挂载表里（唯一的持久改动是一个 `persist.*` 属性 + 两处备份副本）。
 
-## 铁律：改任何东西之前先读懂这三条
+## 铁律：改任何东西之前先读懂这四条
 
-这三条是整个仓库踩出来的核心结论，违反其中任何一条都会**静默失效**（不报错、自检却照常全绿），务必牢记：
+这四条是整个仓库踩出来的核心结论，违反其中任何一条都会**静默失效**（不报错、自检却照常全绿），务必牢记：
 
 1. **A2DP 的 devicePort 必须挂在名为 `bluetooth` 的 module 下**，挂 `primary` 会静默无声。
    HAL 按 `audio.<moduleName>.default.so` 查找，而这些机器上没有 `audio.a2dp.default.so`。
-2. **XML 列表分隔符随 ROM 而变，与 Android 版本无关**（同是 SDK 37，marble 用空格、
-   raphael 用逗号）。写错不报错，只把 profile 降级成 `[dynamic rates]` → A2DP 打不开、蓝牙无声。
-   必须用 `detect_sep()` 逐台探测，**禁止按机型/版本硬编码**。
-3. **bind mount 必须逐层 `--make-private`，且 toybox 的 `mount` 做不到**（报 bad /etc/fstab）。
+2. **XML 列表分隔符由根元素 `version` 决定，与 Android 版本无关**（`7.0`/`7.1` → 空格，
+   `1.0` → 逗号；依据是 `Serializer.cpp` 的 `mSamplingRatesSeparator` 赋值）。写错不报错，
+   只把 profile 降级成 `[dynamic rates]` → A2DP 打不开、蓝牙无声。
+   `sep_by_version()` 按 `version` 判定（权威来源），`detect_sep()` 只在 `version`
+   读不到时兜底。**`encodedFormats` 是例外**：AOSP 对它写死空格
+   （`Serializer.cpp:568`），**禁止**让它跟随 `samplingRates` 的风格。
+   **禁止按机型/ROM 硬编码分隔符。**
+3. **「已是目标形态」（awk 退出码 2）的判据必须含三样**：端口在 `bluetooth` 下、
+   端口声明了 LHDC、且 `a2dp output` mixPort 与指向它的 route 都存在。
+   只看 devicePort 会把「端口齐但无出口」的半成品判成无需改动 —— 照样静默无声，
+   而模块自检全绿。判定这类「假绿」要拿判据本身去对，不要只信自检输出。
+4. **bind mount 必须逐层 `--make-private`，且 toybox 的 `mount` 做不到**（报 bad /etc/fstab）。
    必须用 busybox 的 `mount`。不置 private，层会留在 `/data` 的 peer group 里被开机事件顶掉。
 
 判定「真生效」的一眼判据（不要只看模块自检，那可能是绿的）：

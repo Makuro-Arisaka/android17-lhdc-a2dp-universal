@@ -191,8 +191,51 @@ I AS.AudioDeviceInventory: APM failed to make available A2DP device addr=… err
    ```
 
 2. `lc_check_a2dp_profile()` 在 `service` 阶段**对账运行态转储**：`a2dp output` 段里
-   必须出现 `sampling rates:`；若出现 `[dynamic rates]` 就报 `ERROR`。
+   必须出现**非空的** `sampling rates:` 值。
    （v2.1.0 之前没有这道自检，才让问题藏了那么久。）
+
+   > ⚠️ 这道自检本身也曾是「假绿」。`AudioProfile::dump` 的失败态打印成**同一行**：
+   > `sampling rates: [dynamic rates]`（两个格式串 `"%*ssampling rates: "` 与
+   > `"[dynamic rates]"` 都在 `libaudiofoundation.so` 里）。早先的判定把
+   > `*"sampling rates:"*` 排在前面，于是**失败态先命中了它**，被报成「已正确解析 ✓」——
+   > 这正是本文档反复提到的「自检照样全绿」的根源之一。
+   > v2.1.4 起改为**先查 `[dynamic rates]`、再查 `sampling rates:`，并额外拒绝空值列表**。
+
+### ⚠️ 「已是目标形态」的判据不能只看 devicePort（v2.1.4 的关键修复）
+
+`patch_policy.awk` 用退出码 2 表示「本来就是目标形态、无需改动」。早先这个判据**只看
+A2DP 的 devicePort**（是否都在 `bluetooth` module 下、是否都声明了 LHDC），于是下面这种
+半成品会被判成「无需改动」：
+
+```xml
+<!-- 端口齐全、LHDC 也有，但没有任何 a2dp output 出口 -->
+<module name="bluetooth" halVersion="2.0">
+    <devicePorts>
+        <devicePort tagName="BT A2DP Out" ... encodedFormats="... AUDIO_FORMAT_LHDC">…</devicePort>
+        <devicePort tagName="BT A2DP Headphones" .../>…
+    </devicePorts>
+    <!-- 没有 <mixPort name="a2dp output">，也没有 <routes> -->
+</module>
+```
+
+这种形态下 A2DP 输出**依然打不开、依然无声**，但脚本认定「无需改动」而直接退出。
+
+v2.1.4 起，判据扩为三样**同时**满足才算目标形态：
+
+1. 所有 A2DP devicePort 都挂在 `bluetooth` module 下
+2. 每个端口都声明了 `AUDIO_FORMAT_LHDC`（且采样率齐全）
+3. `a2dp output` mixPort **存在**，且每个端口都有 route 指向它
+
+配套修掉的三处同类疏漏（都会产出畸形 XML 或漏补）：
+
+| 场景 | 症状 |
+|---|---|
+| 部分端口已在 `bluetooth`、部分还在 `primary` | 已在模块内的端口被**重复插入**一份 |
+| `bluetooth` module 来自 `xi:include`，本文件 primary 下也有同名端口 | devicePort 与 route 各**重复**一份，`a2dp output` 也可能重复 |
+| 端口已在 `bluetooth` 下但**缺 LHDC** | 只走「整块搬迁」路径才补 LHDC，已在模块内的端口被**漏补** |
+
+另外，`normrate()` 改为**整表重建**：按词元切分原列表 → 去重 → 补标准采样率 → 统一用
+本 ROM 的分隔符连接。顺带解决「原文件自己就混用了两种分隔符」的病态 ROM。
 
 ### ⚠️ sku 判定必须分档：平台名不是 sku 名（v2.1.1 的关键修复）
 
