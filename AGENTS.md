@@ -56,8 +56,10 @@ dumpsys media.audio_policy | grep -A5 '"a2dp output";'
 - **文件清单来自 `git ls-files`**，不在排除表里的都会进包。所以**新增仓库文件时，
   必须同时判断它该不该进包**，该排除就加进 `build.sh` 的 `is_excluded()`。
 - **不该进包的东西**：`.github/`、`README.en.md`、`AGENTS.md`、`build.sh`、`.git*`、
-  `state/`、取证文件（`ap.txt`/`dumpsys*.txt` 等）、`.zip`/`.sha256`。判断标准：
+  `tests/`、`state/`、取证文件（`ap.txt`/`dumpsys*.txt` 等）、`.zip`/`.sha256`。判断标准：
   设备侧运行时用不到的、只服务于开发/GitHub 的，一律不进包。
+  `tests/` 属此类（依赖 bash、git、可写临时目录）；但 `lib/install_check.sh`
+  **必须进包** —— 设备上的 `customize.sh` 要 source 它。
 - **跨机器可复现的两个坑**（已修，别回退）：① zip 条目顺序要靠显式排序的文件列表，
   不能 `zip -r .`（readdir 顺序随文件系统变）；② 权限位要全量显式 chmod
   （目录 755 / 根脚本 755 / 其余 644），且根脚本那条必须配 `-maxdepth 1`，
@@ -71,12 +73,14 @@ dumpsys media.audio_policy | grep -A5 '"a2dp output";'
 |---|---|---|
 | `module.prop` | 模块声明（id / 版本 / 描述） | ✅ |
 | `lhdc.conf` | 用户可改配置（SKU / FORCE / MIN_SDK …） | ✅ |
-| `customize.sh` | 安装期补脚本 x 位（KernelSU 解压丢权限） | ✅ |
+| `customize.sh` | 安装期：**先查适用范围**（不满足即 abort），再补脚本 x 位 + 清残留 state | ✅ |
 | `post-fs-data.sh` | 早于 audioserver：定位→备份→打补丁→挂载；`--dry-run` 只读诊断 | ✅ |
 | `service.sh` | late_start：校验 overlay + 运行态自检 + 反查活跃策略 | ✅ |
 | `uninstall.sh` | 摘挂载 + 原文件体检 + 必要时兜住 | ✅ |
 | `lib/common.sh` | 共享函数库（被 source，**必须 644**） | ✅ |
+| `lib/install_check.sh` | 安装期只读检查（被 customize.sh source，**必须 644**） | ✅ |
 | `lib/patch_policy.awk` | XML 补丁器（POSIX awk，设备上无 Python） | ✅ |
+| `tests/run-install-check.sh` + `tests/fixtures/` | 本地回归测试（假设备 + 最小化 XML 样例），用假 vendor 树与 getprop/ui_print/abort 垫片跑 | ❌ |
 | `build.sh` | 打包脚本 | ❌ |
 | `.github/` | Actions 发版 workflow + Release 模板 | ❌ |
 | `README.md` / `README.en.md` | 用户文档（前者进包，后者不进） | 见右 |

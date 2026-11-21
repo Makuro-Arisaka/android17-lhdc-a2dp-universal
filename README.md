@@ -310,12 +310,70 @@ blob 里同时含 `taro` 和 `ukee` → **一次选中 `sku_taro` 和 `sku_ukee`
 
 ## 适用前提
 
+**这些条件在安装时就会被检查。** 不满足就直接中止安装，并在 root 管理器的安装
+控制台上写明是哪一条不满足 —— 不会出现「装成功了却毫无反应」：
+
+```
+****************************************
+ LHDC A2DP Enabler — 安装前适用范围检查
+****************************************
+ 模块 : android17-lhdc-a2dp-universal v2.1.4
+ 设备 : marble / 22122RK93C
+ 固件 : Xiaomi/marble/marble:17/...
+ 配置 : MIN_SDK=37 FORCE=0 SKU=（自动） PATCH_ALL=1
+
+ [OK] awk 补丁器       : /system/bin/awk
+ [OK] Android SDK      : 37（要求 >= 37）
+ [OK] 蓝牙音频 HAL     : /vendor/lib64/hw/audio.bluetooth.default.so
+ [OK] 策略文件         : 找到 1 个候选
+        · /vendor/etc/audio/sku_ukee/audio_policy_configuration.xml
+          → 可打补丁
+          → INFO: separator samplingRates=[ ] (version=7.0) encodedFormats=[ ] (AOSP 固定)
+ [OK] AOSP 蓝牙栈      : /apex/com.android.bt
+ [OK] 传播隔离工具     : /data/adb/magisk/busybox
+ [--] offload 属性     : supported=true disabled=false
+----------------------------------------
+ 结论: 符合适用范围 → 继续安装
+ 注意: 安装成功 ≠ 已经出声。重启后由 post-fs-data 打补丁并挂载，
+       验证方法见 README「验证是否生效」那节
+```
+
+不满足时长这样（**在安装控制台上，不是开机后的日志里**）：
+
+```
+----------------------------------------
+ 结论: 不符合适用范围，安装将中止
+
+ 不符合的要求:
+   - Android 版本不满足：SDK=36 < MIN_SDK=37。AOSP 的 LHDCv5 编码器自
+     Android 17（SDK 37）起才内置，低版本上补这条路由不会有 LHDC 声音
+
+ 处理办法:
+   · 换满足条件的设备/ROM（Android 17 + AOSP 蓝牙栈 + 高通 PAL 混合架构）
+   · 确认要强上：在模块目录 lhdc.conf 里设 FORCE=1 后重新安装
+   · 只想看诊断：不装模块，直接跑 post-fs-data.sh --dry-run
+```
+
+下面四条是**硬性要求**（任一不满足 → 中止安装）：
+
 | # | 条件 | 检查方法 | 不满足会怎样 |
 |---|---|---|---|
-| 1 | Android 17+（SDK 37） | `getprop ro.build.version.sdk` | 没有 LHDC 编码器，模块救不了（改 `MIN_SDK` / `FORCE=1` 可强上） |
-| 2 | AOSP 蓝牙栈 + 高通 PAL 混合架构 | `ls /apex/com.android.bt` | 纯高通栈设备 offload 本来就通，不需要本模块 |
-| 3 | 存在 `audio.bluetooth.default.so` | `ls /vendor/lib64/hw/audio.bluetooth.default.so` | 新 module 加载失败 → 自动跳过（可用 `FORCE=1` 强上） |
-| 4 | 策略文件里有 `BT A2DP Out` 等端口 | `grep 'BT A2DP' <策略文件>` | awk 报 `no A2DP devicePort found` 并跳过 |
+| 1 | awk 可用 | `command -v awk` | 中止：没有 awk 生成不出补丁策略 |
+| 2 | Android 17+（SDK 37） | `getprop ro.build.version.sdk` | 中止：没有 LHDC 编码器，模块救不了（改 `MIN_SDK` / `FORCE=1` 可强上） |
+| 3 | 存在 `audio.bluetooth.default.so` | `ls /vendor/lib64/hw/audio.bluetooth.default.so` | 中止：新 module 必然加载失败（可用 `FORCE=1` 强上） |
+| 4 | 策略文件里有 A2DP 端口 | `grep 'BT A2DP' <策略文件>` | 中止：补丁器试运行报 `no A2DP devicePort found` |
+
+**最后一条是"试运行"而不是"看有没有"**：安装期会把补丁器对每个候选策略文件真跑
+一遍（输出丢到 `/dev/null`，只留 stderr 的 `separator` 提示行），退出码 `0`（可打补丁）
+或 `2`（已是目标形态）才算通过。这样连「文件能读到但结构畸形」也会被挡在安装阶段。
+
+另有几条**软性提示**，只警告不阻止安装：
+
+| 提示 | 为什么只警告 |
+|---|---|
+| 未找到 `/apex/com.android.bt` | 判据是 HAL 而不是「蓝牙栈在哪个目录」，某些 ROM 布局不同 |
+| 没有可用 busybox | 层无法置 private，可靠性下降但有运行态兜底（见下一节） |
+| `a2dp_offload.disabled=true` | 运行期会被 `OFFLOAD_FIX=1` 自动改回 `false` |
 
 **不适用**：编码器本身缺失的设备（`lhdc_codec_support=FALSE`，或 Android < 17）。
 **模块只负责把音频接到正确的 HAL 通路，它不提供编码器。**
@@ -352,8 +410,8 @@ Root 侧无门槛：Magisk / KernelSU / APatch 都行（只用 `post-fs-data.sh`
 | `SKU` | 空 | 强制指定 sku 目录名（`ukee` / `taro` / `kalama` …），留空 = 自动定位 |
 | `PATCH_ALL` | `1` | 无法判定活跃 sku 时是否处理全部候选 |
 | `OFFLOAD_FIX` | `1` | 是否纠正 `a2dp_offload.disabled`（**建议保持 1**） |
-| `FORCE` | `0` | 跳过前置检查，非必要不要开 |
-| `MIN_SDK` | `37` | 低于该 SDK 直接跳过 |
+| `FORCE` | `0` | 跳过适用范围检查（**安装期也跳**），非必要不要开 |
+| `MIN_SDK` | `37` | 低于该 SDK 直接跳过；安装期的版本检查也用这个值 |
 | `VERBOSE` | `0` | 额外输出到 stdout |
 | `LHDC_DUMPSYS_TIMEOUT` | `20` | `dumpsys` 单次调用超时（秒）。设备被**别的**故障拖到高负载时可调小；别设 0 |
 
@@ -571,13 +629,17 @@ adb shell "su -c '/system/bin/reboot'"
 android17-lhdc-a2dp-universal/
 ├── module.prop            模块声明
 ├── lhdc.conf              用户配置
-├── customize.sh           安装期：补脚本权限（KernelSU 解压会丢 x 位）
+├── customize.sh           安装期：先查适用范围（不满足即中止），再补脚本权限
 ├── post-fs-data.sh        开机早段：定位 → 备份 → 打补丁 → 挂载
 ├── service.sh             开机后：校验 / 反查活跃策略 / 导出备份
 ├── uninstall.sh           卸载：摘挂载 + 原文件体检 + 必要时兜住
 ├── lib/
 │   ├── common.sh          共享函数库（定位、备份、打补丁、挂载）
+│   ├── install_check.sh   安装期适用范围检查（只读，结论打到安装控制台）
 │   └── patch_policy.awk   XML 补丁器（POSIX awk）
+├── tests/                 本地回归测试（**不进包**）
+│   ├── run-install-check.sh
+│   └── fixtures/          最小化策略 XML 样例
 ├── .github/
 │   ├── workflows/release.yml   推 v* 标签即自动构建 + 发版（**不进包**）
 │   └── RELEASE_TEMPLATE.md     Release 说明模板（**不进包**）
@@ -587,6 +649,26 @@ android17-lhdc-a2dp-universal/
 ├── LICENSE                GPL-3.0 全文
 └── state/                 运行时生成，含备份与日志（**不进包**）
 ```
+
+---
+
+## 安装
+
+装模块前不会检查任何东西 —— **检查发生在安装脚本里**（`customize.sh`），也就是
+root 管理器解压之后、安装收尾之前。所以结论会出现在**安装控制台**上，不满足时
+管理器会把这次安装标成**失败**。
+
+```bash
+adb push ../android17-lhdc-a2dp-universal.zip /data/local/tmp/
+adb shell su -c 'ksud module install /data/local/tmp/android17-lhdc-a2dp-universal.zip'   # KernelSU
+# Magisk：在管理器里选「从本地安装」那个 zip
+```
+
+安装阶段严格只读：检查用 `DRY_RUN=1` 跑（`lib/common.sh` 里所有写原语的总闸门），
+**检查不通过时设备上除控制台输出外不留任何痕迹**，也不会建出 `state/` 目录。
+通过之后才补脚本 x 位（KernelSU 解压会丢）并清掉残留的 `state/`。
+
+KernelSU 会先放进 `modules_update/`，**重启后才转正**。本项目惯例再存一份到 `/sdcard/`。
 
 ---
 
@@ -620,15 +702,35 @@ android17-lhdc-a2dp-universal/
   不得混入 `.git` / `state/`、zip 内权限位必须是脚本 755 / 数据 644
 - 同时输出 `.sha256`，方便核对「设备上那个包 == 这个 commit」
 
-把包装到设备：
+装到设备的方式见上面的「[安装](#安装)」一节（也别忘了安装期会先跑适用范围检查）。
+
+### 跑本地回归测试
+
+`tests/` 下的测试**不进包**（设备侧没有 bash、git 和可写的临时目录），只在开发机上跑：
 
 ```bash
-adb push ../android17-lhdc-a2dp-universal.zip /data/local/tmp/
-adb shell su -c 'ksud module install /data/local/tmp/android17-lhdc-a2dp-universal.zip'   # KernelSU
-# Magisk：在管理器里选「从本地安装」那个 zip
+bash tests/run-install-check.sh
 ```
 
-KernelSU 会先放进 `modules_update/`，**重启后才转正**。本项目惯例再存一份到 `/sdcard/`。
+它会用 `LHDC_ETC_ROOTS` / `LHDC_HAL_DIRS` 覆盖成临时目录里的假 vendor 树，
+并在 `PATH` 前插入 `getprop` / `ui_print` / `abort` 三个垫片来模拟 root 管理器，
+覆盖这些场景：
+
+| # | 场景 | 期望 |
+|---|---|---|
+| 1 | SDK=37 + HAL + 可打补丁 | 通过 |
+| 2 | SDK=36 | 拒绝并指明版本不满足 |
+| 3 | 缺 `audio.bluetooth.default.so` | 拒绝并点名缺的文件 |
+| 4 | 找不到候选策略文件 | 拒绝 |
+| 5 | 策略文件里没有 A2DP 端口 | 补丁器试运行失败 → 拒绝 |
+| 6 | `version=1.0` | 判为逗号风格；`version=7.0` 判空格 |
+| 7 | 已是目标形态（退出码 2） | 视为通过 |
+| 8 | SDK=36 + `FORCE=1` | 强制放行并说明 |
+| 9 | 检查失败 | 不创建 `state/`（只读承诺） |
+| 10 | SDK=36 跑完整 `customize.sh` | 走 `abort`，退出码非 0 |
+| 11 | SDK=37 跑完整 `customize.sh` | 安装继续并提示重启 |
+| 12 | 安装后权限 | 根脚本 755 / 库文件 644 |
+| 13 | 安装成功 | 清掉残留 `state/` |
 
 ### 下载预编译包（Releases）
 

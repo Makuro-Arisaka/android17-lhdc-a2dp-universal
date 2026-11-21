@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 已经是目标形态（bluetooth module + LHDC + a2dp output + routes 齐全）。
+     补丁器应返回退出码 2 = 无需改动。 -->
+<audioPolicyConfiguration version="7.0" xmlns:xi="http://www.w3.org/2001/XInclude">
+    <globalConfiguration speaker_drc_enabled="true"/>
+    <modules>
+        <module name="primary" halVersion="3.0">
+            <devicePorts>
+                <devicePort tagName="Speaker" type="AUDIO_DEVICE_OUT_SPEAKER" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="44100 48000"
+                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </devicePort>
+            </devicePorts>
+            <routes>
+                <route type="mix" sink="Speaker" sources="primary output"/>
+            </routes>
+        </module>
+        <module name="bluetooth" halVersion="2.0">
+            <mixPorts>
+                <mixPort name="a2dp output" role="source">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="44100 48000 88200 96000"
+                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </mixPort>
+            </mixPorts>
+            <devicePorts>
+                <devicePort tagName="BT A2DP Out" type="AUDIO_DEVICE_OUT_BLUETOOTH_A2DP" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="44100 48000 88200 96000"
+                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                    <encodedFormats>AUDIO_FORMAT_SBC AUDIO_FORMAT_AAC AUDIO_FORMAT_LHDC</encodedFormats>
+                </devicePort>
+            </devicePorts>
+            <routes>
+                <route type="mix" sink="BT A2DP Out" sources="a2dp output"/>
+            </routes>
+        </module>
+    </modules>
+</audioPolicyConfiguration>

@@ -15,9 +15,13 @@ LHDC_AWK=""
 
 # ---------------------------------------------------------------- 用户配置
 # 优先级：命令行/环境变量 > lhdc.conf > 这里的默认值
-__env_SKU=$SKU; __env_PATCH_ALL=$PATCH_ALL; __env_OFFLOAD_FIX=$OFFLOAD_FIX
-__env_FORCE=$FORCE; __env_MIN_SDK=$MIN_SDK; __env_VERBOSE=$VERBOSE
-__env_DT=$LHDC_DUMPSYS_TIMEOUT
+#
+# ⚠️ 一律用 ${VAR:-} 取值，不能写 $VAR：本文件会被 customize.sh 在**安装期**
+#    source，而不同 root 管理器启动安装脚本时的 shell 选项并不一致（有的带
+#    `set -u`）。裸 $VAR 在 nounset 下会直接报「未绑定的变量」让整个安装失败。
+__env_SKU=${SKU:-}; __env_PATCH_ALL=${PATCH_ALL:-}; __env_OFFLOAD_FIX=${OFFLOAD_FIX:-}
+__env_FORCE=${FORCE:-}; __env_MIN_SDK=${MIN_SDK:-}; __env_VERBOSE=${VERBOSE:-}
+__env_DT=${LHDC_DUMPSYS_TIMEOUT:-}
 
 : "${SKU:=}"            # 强制指定 sku 目录名（如 ukee / taro）；留空 = 自动定位
 : "${PATCH_ALL:=1}"     # 无法判定活跃 sku 时，是否处理全部候选（安全兜底）
@@ -30,6 +34,8 @@ __env_DT=$LHDC_DUMPSYS_TIMEOUT
 # 策略文件搜索根目录。非标准 ROM 可覆盖；也可用于离线测试。
 : "${LHDC_ETC_ROOTS:=/vendor/etc/audio /odm/etc/audio /vendor/odm/etc/audio}"
 : "${LHDC_ETC_TOPDIRS:=/vendor/etc/audio /odm/etc/audio /vendor/odm/etc/audio /vendor/etc /odm/etc}"
+# AOSP 蓝牙音频 HAL 的搜索目录。同样可覆盖：非标准 ROM，或离线测试用。
+: "${LHDC_HAL_DIRS:=/vendor/lib64/hw /vendor/lib/hw /odm/lib64/hw /odm/lib/hw /system/lib64/hw /system/lib/hw}"
 
 [ -f "$LHDC_CONF" ] && . "$LHDC_CONF"
 
@@ -142,12 +148,21 @@ lc_pick_awk() {
     return 1
 }
 
-lc_hal_present() {
+# 打印找到的 AOSP 蓝牙音频 HAL 路径（供安装检查/诊断展示），找不到返回 1。
+# 只读，不写盘 —— 安装期检查也调它。
+lc_hal_path() {
     local d
-    for d in /vendor/lib64/hw /vendor/lib/hw /odm/lib64/hw /odm/lib/hw /system/lib64/hw /system/lib/hw; do
-        [ -f "$d/audio.bluetooth.default.so" ] && return 0
+    for d in $LHDC_HAL_DIRS; do
+        if [ -f "$d/audio.bluetooth.default.so" ]; then
+            echo "$d/audio.bluetooth.default.so"
+            return 0
+        fi
     done
     return 1
+}
+
+lc_hal_present() {
+    lc_hal_path >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------- 目标定位

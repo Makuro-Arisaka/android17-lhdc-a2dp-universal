@@ -119,6 +119,10 @@ is_excluded() {
         # AGENTS.md：面向 AI 编码助手/贡献者的仓库说明，设备侧无用，进包只增大体积、
         # 并扰动包 sha256。与 README.en.md、.github/ 同理，属仓库工程文件。
         AGENTS.md)                          return 0 ;;
+        # tests/：本地回归测试与 fixture，只在开发机上跑（依赖 bash、git、可写的
+        # 临时目录，设备侧都没有）。lib/install_check.sh 本身是进包的 —— 设备上
+        # 安装阶段要 import 它；被排除的只是 tests/。
+        tests/*|tests)                      return 0 ;;
         # CI 配置：Release 由 GitHub Actions 构建，workflow 本身是仓库工程文件，
         # 与「装到设备上的模块」无关。它必须被排除，否则 Actions 打出的包会比
         # 本地包多出 .github/ 一个条目 → sha256 对不上，可复现验证直接失效。
@@ -193,7 +197,7 @@ if [ "$NOCHECK" = 0 ]; then
 
     # --- 必需文件 ---
     REQUIRED=(module.prop lhdc.conf post-fs-data.sh service.sh uninstall.sh customize.sh
-              lib/common.sh lib/patch_policy.awk)
+              lib/common.sh lib/patch_policy.awk lib/install_check.sh)
     missing=0
     for r in "${REQUIRED[@]}"; do
         if [ -e "$r" ]; then ok "存在 $r"; else warn "缺少 $r"; missing=1; fi

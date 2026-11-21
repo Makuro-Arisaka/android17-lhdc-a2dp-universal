@@ -294,12 +294,56 @@ The hit is written to the log: `INFO: sku 由 ro.boot.product.vendor.sku=ukee �
 
 ## Requirements
 
+**These are checked at install time.** If any hard requirement is not met, the install
+is aborted and the root manager's install console says which one failed — you never get
+"installed successfully but nothing happens":
+
+```
+****************************************
+ LHDC A2DP Enabler — pre-install requirement check
+****************************************
+ module : android17-lhdc-a2dp-universal v2.1.4
+ device : marble / 22122RK93C
+ vendor : Xiaomi/marble/marble:17/...
+ config : MIN_SDK=37 FORCE=0 SKU=(auto) PATCH_ALL=1
+
+ [OK] awk patcher      : /system/bin/awk
+ [OK] Android SDK      : 37 (requires >= 37)
+ [OK] Bluetooth HAL    : /vendor/lib64/hw/audio.bluetooth.default.so
+ [OK] Policy file      : 1 candidate found
+        · /vendor/etc/audio/sku_ukee/audio_policy_configuration.xml
+          -> patchable
+          -> INFO: separator samplingRates=[ ] (version=7.0) encodedFormats=[ ] (AOSP fixed)
+ [OK] AOSP BT stack    : /apex/com.android.bt
+ [OK] Propagation tool : /data/adb/magisk/busybox
+ [--] offload props    : supported=true disabled=false
+----------------------------------------
+ Result: within scope -> continue installation
+ Note: a successful install does NOT mean audio already works. After reboot,
+       post-fs-data patches and mounts it; see "Verifying it works" in the README.
+```
+
+Hard requirements (any failure aborts the install):
+
 | # | Condition | How to check | If not met |
 |---|---|---|---|
-| 1 | Android 17+ (SDK 37) | `getprop ro.build.version.sdk` | No LHDC encoder exists; this module cannot help (set `MIN_SDK` / `FORCE=1` to force) |
-| 2 | AOSP Bluetooth stack + Qualcomm PAL hybrid | `ls /apex/com.android.bt` | A pure-Qualcomm-stack device's offload already works; it does not need this module |
-| 3 | `audio.bluetooth.default.so` exists | `ls /vendor/lib64/hw/audio.bluetooth.default.so` | The new module fails to load → auto-skip (can force with `FORCE=1`) |
-| 4 | The policy file has ports like `BT A2DP Out` | `grep 'BT A2DP' <policy file>` | awk reports `no A2DP devicePort found` and skips |
+| 1 | awk is available | `command -v awk` | Abort: without awk the patched policy cannot be generated |
+| 2 | Android 17+ (SDK 37) | `getprop ro.build.version.sdk` | Abort: no LHDC encoder exists (set `MIN_SDK` / `FORCE=1` to force) |
+| 3 | `audio.bluetooth.default.so` exists | `ls /vendor/lib64/hw/audio.bluetooth.default.so` | Abort: the new module cannot load (can force with `FORCE=1`) |
+| 4 | The policy file has A2DP ports | `grep 'BT A2DP' <policy file>` | Abort: the patcher trial run reports `no A2DP devicePort found` |
+
+Requirement 4 is a **trial run**, not a grep: the installer actually runs the patcher
+on every candidate policy file (stdout discarded, only the `separator` stderr line is
+kept). Exit code `0` (patchable) or `2` (already the target shape) passes. That way even
+"readable but structurally broken" files are stopped at install time.
+
+Soft signals only warn:
+
+| Signal | Why it does not block |
+|---|---|
+| `/apex/com.android.bt` missing | The criterion is the HAL, not where the stack lives; some ROMs differ |
+| No usable busybox | The overlay cannot be made private; reliability drops but a runtime fallback exists |
+| `a2dp_offload.disabled=true` | `OFFLOAD_FIX=1` corrects it at boot |
 
 **Not applicable**: devices that lack the encoder itself (`lhdc_codec_support=FALSE`, or Android < 17).
 **This module only routes audio to the correct HAL path; it does not provide an encoder.**
@@ -330,8 +374,8 @@ Edit `lhdc.conf` in the module directory; takes effect on next boot:
 | `SKU` | empty | Force a sku directory name (`ukee` / `taro` / `kalama` …); empty = auto-detect |
 | `PATCH_ALL` | `1` | Whether to patch all candidates when the active sku cannot be determined |
 | `OFFLOAD_FIX` | `1` | Whether to correct `a2dp_offload.disabled` (**recommended: keep 1**) |
-| `FORCE` | `0` | Skip pre-checks; do not enable unless necessary |
-| `MIN_SDK` | `37` | Skip outright below this SDK |
+| `FORCE` | `0` | Skip the pre-checks (**including at install time**); do not enable unless necessary |
+| `MIN_SDK` | `37` | Skip outright below this SDK; the install-time check uses the same value |
 | `VERBOSE` | `0` | Extra output to stdout |
 | `LHDC_DUMPSYS_TIMEOUT` | `20` | Per-call `dumpsys` timeout (seconds). Lower it if the device is dragged to high load by **other** faults; do not set 0 |
 
@@ -533,13 +577,17 @@ Where the stock backup lives:
 android17-lhdc-a2dp-universal/
 ├── module.prop            module declaration
 ├── lhdc.conf              user configuration
-├── customize.sh           install time: fix script permissions (KernelSU drops the x bit)
+├── customize.sh           install time: check requirements first (abort if not met), then fix permissions
 ├── post-fs-data.sh        early boot: locate -> back up -> patch -> mount
 ├── service.sh             after boot: verify / reverse-look-up active policy / export backup
 ├── uninstall.sh           uninstall: take down mounts + check original file + hold if needed
 ├── lib/
 │   ├── common.sh          shared library (locate, back up, patch, mount)
+│   ├── install_check.sh   install-time requirement check (read-only, prints to install console)
 │   └── patch_policy.awk   XML patcher (POSIX awk)
+├── tests/                 local regression tests (**not packaged**)
+│   ├── run-install-check.sh
+│   └── fixtures/          minimal policy XML samples
 ├── .github/
 │   ├── workflows/release.yml   push a v* tag -> auto build + release (**not packaged**)
 │   └── RELEASE_TEMPLATE.md     release notes template (**not packaged**)
