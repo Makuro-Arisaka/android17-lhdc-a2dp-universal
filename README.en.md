@@ -184,3 +184,7 @@ commit the change, and push a `v*` tag. GitHub Actions then builds the Release.
 ## License
 
 [GNU General Public License v3.0](LICENSE)
+
+---
+
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
