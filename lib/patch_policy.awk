@@ -2,28 +2,9 @@
 #
 # 把一个 Android audio_policy_configuration.xml 改成「LHDC 可出声」的形态。
 #
-# 背景
-# ----
-# 混合架构设备（AOSP 蓝牙栈 + 高通音频 HAL）上，A2DP 只有两条互斥通路：
-#   (a) QCOM offload —— PAL 驱动厂商 BT HAL。需要蓝牙栈去开 QTI HIDL session，
-#       AOSP 栈永远不会做，于是永远拿不到 encoder config：
-#           E PAL: Bluetooth: startPlayback: invalid encoder config
-#           E AHAL: onWriteError: write error -22
-#       表现是持续静音（并约每 50ms 重试）。
-#   (b) AOSP 软件编码 —— APM 打开 audio.bluetooth.default.so 的 a2dp output，
-#       蓝牙栈进程内编码。Android 17 内置 LHDCv5 编码器（lhdcv5BT_enc）。
-#       只有这条通路能跑 LHDC。
-#
-# 原厂把 A2DP 端口声明在 primary 下（通路 a），通路 b 不可达。本脚本把 A2DP
-# 端口搬到名为 bluetooth 的 module（映射 audio.<moduleName>.default.so），
-# 并补上 AUDIO_FORMAT_LHDC。
-#
-# 三种情形
-# --------
-#   1) 本文件里已有名为 bluetooth 的 module      → 只补 LHDC / 采样率，不动结构
-#   2) 本文件里没有，但某个 xi:include 的文件里有 → 把那个 module 吸收进本文件，
-#      删掉该 include（否则运行时会同时存在两个同名 module），再补 A2DP 端口
-#   3) 都没有                                    → 新建一个 module
+# 将 A2DP devicePort 迁移到 bluetooth module，补全 AUDIO_FORMAT_LHDC、
+# 采样率、a2dp output mixPort 和 route。已有 bluetooth module 时直接修改；
+# module 位于 xi:include 文件中时先合并，再删除原 include。
 #
 # 用法:  awk -f patch_policy.awk < input.xml > output.xml
 # 退出码: 0=已打补丁   2=本来就是目标形态   1=失败/找不到 A2DP 端口
@@ -116,29 +97,8 @@ function rebody(t, pad,    base) {
 }
 # ------------------------------------------------------------------ XML 编辑
 
-# 按内容探测某个「列表型属性」的分隔符风格（"," 或 " "），探测不到返回 ""。
-#
-# ⚠️ 这是**兜底**手段，不是首选。首选是根元素的 version 属性（见 sep_by_version）——
-#    因为 APM 的行为只由 version 决定，与我们写什么无关。
-#    本函数只在 version 读不到、或不是 1.0/7.0/7.1 时才被调用。
-#
-# ★ 为什么写错分隔符是灾难性的（两种方法都要防的失效模式）
-#   实测：同一个 AOSP 属性的分隔符风格**随 ROM 而变**——
-#     Redmi K20 Pro (Android 17, version=1.0)：samplingRates / channelMasks 用逗号
-#     realme GT5 Pro (Android 17, version=7.0)：全部用空格
-#     POCO F5       (Android 16)：全部用空格
-#   而**列表分隔符写错不会报任何错**：
-#   解析器只是把该 profile 悄悄降级成 "[dynamic rates]"（采样率表为空），
-#   随后 APM 在 openOutputWithProfileAndDevice() 里 "missing param" 返回失败，
-#   表现为 "checkOutputsForDevice(): No output available for device 0080" →
-#   A2DP 输出永远打不开 → A2DP 设备永远不可用 → 蓝牙彻底无声。
-#   现场日志里既没有 XML 语法错误、也没有 seccomp/权限错误，极难定位。
-#
-#   判据：属性值里出现逗号 → 逗号风格；只出现空格（且无逗号）→ 空格风格。
-#   单值属性（无任何分隔符）两种都不计。
-#
-#   ⚠️ 本函数是纯文本扫描，**不跳过 XML 注释**。若某文件的注释里出现逗号，
-#      统计会被带偏。这正是它只能当兜底的原因之一。
+# 在缺少有效根元素 version 时，从现有属性值推测列表分隔符。
+# 这里不解析 XML 注释，因此只作为 sep_by_version() 的回退。
 function detect_sep(t, prop,    k, a, b, v, nc, ns, rest) {
     nc = 0; ns = 0
     rest = t
@@ -158,16 +118,8 @@ function detect_sep(t, prop,    k, a, b, v, nc, ns, rest) {
     return ""
 }
 
-# 从根元素读 audioPolicyConfiguration 的 version 属性。读不到返回 ""。
-#
-# ★ 为什么要读它：APM 就是按这个属性决定分隔符的（见 sep_by_version），
-#   所以它是**权威来源**；按内容猜（detect_sep）只是它读不到时的兜底。
-#
-# ⚠️ 搜索必须**限定在根元素标签内**（到第一个 '>' 为止）。
-#    早先的写法是从 "<audioPolicyConfiguration" 起无条件往后找 version="
-#    —— 根元素没写 version 时它会一路往后扫，撞上注释或子元素里的
-#    version="..."（实测：注释里放 version="1.0" 就能把它骗出错误的逗号判定），
-#    而那正是本函数要防的那类静默失效。
+# 只在 audioPolicyConfiguration 根标签内读取 version，避免使用子节点或注释中的
+# 同名属性。APM 根据此版本选择列表分隔符。
 function detect_root_version(t,    k, gt, seg, a, b) {
     k = index(t, "<audioPolicyConfiguration")
     if (k == 0) return ""
@@ -183,11 +135,7 @@ function detect_root_version(t,    k, gt, seg, a, b) {
 }
 
 # version → samplingRates / channelMasks 的分隔符。
-# 规则抄自 AOSP（frameworks/av/services/audiopolicy/common/managerdefinitions/src/Serializer.cpp）：
-#     L251   std::string mSamplingRatesSeparator = ",";        // 默认
-#     L884   if (version == "7.0" || version == "7.1") {
-#     L885       mChannelMasksSeparator = mSamplingRatesSeparator = mFlagsSeparator = " ";
-#     L886   } else if (version != "1.0") {  → 报错，文件被拒
+# 对应 AOSP Serializer.cpp 的 mSamplingRatesSeparator / mChannelMasksSeparator 规则。
 # 返回 "" = 版本缺失或不是 1.0/7.0/7.1，调用方需回退到内容探测。
 function sep_by_version(v) {
     if (v == "7.0" || v == "7.1") return " "
@@ -195,13 +143,8 @@ function sep_by_version(v) {
     return ""
 }
 
-# 给 encodedFormats 追加 AUDIO_FORMAT_LHDC（已存在则原样返回）
-#
-# ⚠️ 这里的分隔符固定是空格，不能跟随 samplingRates。
-#    AOSP 在 Serializer.cpp:568 对 encodedFormats 写死了 " "：
-#        encodedFormats = formatsFromString(encodedFormatsLiteral, " ");
-#    它**不**经过 version 判定那套（那只管 samplingRates / channelMasks / flags）。
-#    实测两台设备的 encodedFormats 也都是空格。
+# 向 encodedFormats 添加 LHDC。AOSP 对此属性固定使用空格分隔，
+# 与根元素 version 无关。
 function addlhdc(t,    k, a, b, v, e, sep) {
     sep = (ESEP != "" ? ESEP : " ")
     k = index(t, "encodedFormats=\"")
@@ -222,26 +165,8 @@ function addlhdc(t,    k, a, b, v, e, sep) {
     return substr(t, 1, a - 1) v sep "AUDIO_FORMAT_LHDC" substr(t, a + b - 1)
 }
 
-# 采样率补齐到 AOSP 蓝牙 HAL 的标准集合 44100/48000/88200/96000（只增不减）。
-# 原厂 A2DP 端口常只声明 48000（那是给压缩 offload 用的）；改走 AOSP 软件编码后
-# 44.1kHz 耳机很常见，96kHz 也在 LHDC V5 能力范围内。
-#
-# ⚠️ 拼接时用的分隔符必须是 RSEP（由根元素 version 决定，见 sep_by_version），不能写死：
-#    在空格风格的 ROM 上写逗号（或反之）会得到 "44100,48000,88200 96000" 这种混血列表，
-#    解析器直接放弃 → profile 变 "[dynamic rates]" → A2DP 静默失效（见 detect_sep 注释）。
-#
-# ⚠️ 两个必须处理的边界（都踩过）：
-#   1) v 为空串时不能直接 "44100" sep v —— 会拼出 "44100 " 这种带尾随分隔符的
-#      半成品，后续再追加就变成 "44100  88200 96000"（双分隔符）甚至丢掉原有的 48000。
-#      空串要特殊处理：整串重建为标准集合。
-#   2) 判存在性要用**词元级**比较，不能用 index(v,"48000") 这种子串判断 ——
-#      否则 "148000" 会被误认为已含 48000，漏补。
-#
-# ⚠️ seen 必须走**参数位**声明为局部数组（awk 的惯例），不能用 delete 清空：
-#    `delete arr`（整数组）是 GNU 扩展，POSIX awk / toybox awk / busybox awk 都不保证支持；
-#    而 seen 若是全局数组，跨多次调用会残留上一次的词元，导致漏补。
-#    （seen 在一次调用内跨 while 迭代复用是安全的：每个 profile 的采样率集合
-#      都要补成同一套标准值，累积不会造成错误结果。）
+# 保留并去重已有采样率，再补齐 44100/48000/88200/96000，统一使用 RSEP。
+# 通过 seen 参数创建局部数组，不依赖非 POSIX 的 delete array。
 function normrate(t,    k, a, b, v, out, rest, sep, i, arr, n2, nt, targets, seen, res, tok) {
     sep = (RSEP != "" ? RSEP : ",")
     # 目标集合：AOSP 蓝牙 HAL 的标准采样率（顺序即输出顺序）
@@ -254,12 +179,7 @@ function normrate(t,    k, a, b, v, out, rest, sep, i, arr, n2, nt, targets, see
         if (b == 0) break
         v = substr(rest, a, b - 1)
 
-        # 整表重建：保留原有词元（顺序不变、去重），再按标准顺序补缺失项，
-        # 全部用 RSEP 连接。这样同时解决三件事：
-        #   ① 空列表 → 直接铺满标准集合（不会留下多余/重复分隔符）
-        #   ② 缺项 → 补上，且判存在性是**词元级**（"148000" 不会被当成 48000）
-        #   ③ 原文件本身混用了两种分隔符 → 一并归一化成 RSEP
-        #      （version 与内容风格不一致的病态 ROM 也能救回来）
+        # 按词元处理可同时覆盖空列表、重复项和混用分隔符的输入。
         res = ""
         n2 = split(v, arr, "[, \t]+")
         for (i = 1; i <= n2; i++) {
@@ -299,44 +219,18 @@ function needsfix(t,    k, a, b, v, rest) {
     return 0
 }
 
-# 目标 module 里是否已经有属性 attrname="val" 的标签。
-#
-# ★ 为什么必须查：搬迁时我们是把「本文件里不在 bluetooth 下的 A2DP 端口」整批
-#   插进目标 module。但目标 module 里可能**已经有同名端口**，两种来路：
-#     - 本文件里已有 bluetooth module，且它自己也声明了同名端口（部分搬迁的 ROM）
-#     - bluetooth module 来自被 include 的文件，而本文件 primary 下又重复声明了一份
-#   不做这个检查就会在同一个 module 里插出**重复的 devicePort / route**。
-#   同名端口重复属于未定义行为：routes 的 sink 指向歧义，解析结果不可预期。
+# 检查目标 module 是否已有指定属性值，避免生成重复端口或路由。
 function has_attr_val(seg, attrname, val) {
     if (seg == "" || val == "") return 0
     return index(seg, attrname "=\"" val "\"") > 0
 }
 
-# 就地修补 seg 里所有需要动的 <devicePort ...>（补 LHDC、补齐采样率）。
-# 这个 devicePort 是不是 A2DP 输出端口（只有它才该被改成 LHDC/蓝牙采样率）。
-#
-# ★ 真机踩到的坑（Redmi K20 Pro / raphael，2026-10-13）：
-#   bluetooth module 里除了 3 个 A2DP 端口，还可能有
-#       <devicePort tagName="BT Hearing Aid Out" type="AUDIO_DEVICE_OUT_HEARING_AID">
-#   助听器走的是 ASHA / LE Audio 通路，与 A2DP 无关：
-#     - 它的 encodedFormats 本来就只有 SBC/AAC，**不该**冒出 AUDIO_FORMAT_LHDC
-#     - 它的采样率是 16000/24000 这类语音档，**不该**被改写成 44100/48000/88200/96000
-#   早先 fix_ports_in() 与 needsfix() 都只按「是不是 devicePort」判定，
-#   于是把这个端口一起改了 —— 产出一个语义上错误的策略文件。
-#   实测：设备上 /vendor/etc/bluetooth_hearing_aid_audio_policy_configuration.xml
-#   确实存在并被 xi:include 进来，所以这条路径在真机上是**必现**的，不是理论风险。
+# 仅 A2DP 类型需要修改；助听器等端口继续使用各自的格式和采样率。
 function is_a2dp_port(t) {
     return index(t, "AUDIO_DEVICE_OUT_BLUETOOTH_A2DP") > 0
 }
 
-# 就地修补 seg 里所有需要动的 A2DP <devicePort>（补 LHDC、补齐采样率）。
-#
-# ★ 用在「端口已经在目标 module 里，但缺 LHDC / 采样率不全」的情形。
-#   原先只有 needsfix 触发的整块搬迁路径会补 LHDC，**已经躺在 bluetooth 下的
-#   端口反而被漏掉**——于是模块自检看着绿，那个端口却仍然没有 LHDC。
-#
-# ⚠️ 必须按 type 过滤（见 is_a2dp_port）：module 里可能同时有助听器等其它端口，
-#    对它们补 LHDC / 改采样率是错的。
+# 修补目标 module 内已经存在、但格式或采样率不完整的 A2DP 端口。
 function fix_ports_in(seg,    out, pos, i, p, e, pe) {
     out = ""
     pos = 1
@@ -421,16 +315,7 @@ END {
     s = buf
     if (length(s) < 100) { print "ERR: input too small" > "/dev/stderr"; exit 1 }
 
-    # ---------- 0. 决定本文件的分隔符风格（决定我们生成的文本该怎么写）----------
-    # ★ 权威来源是根元素的 version 属性 —— APM 就是按它选分隔符的（见 sep_by_version）。
-    #   内容探测（detect_sep）只作为它读不到时的兜底。
-    #
-    #   为什么不能只靠内容探测：APM 的行为只由 version 决定，与我们写出的文本无关。
-    #   若某文件 version=7.0 而内容恰好用了逗号（或注释里出现逗号干扰探测），
-    #   内容探测会返回 ","，而 APM 仍按空格切 → 采样率表为空 → profile 变
-    #   "[dynamic rates]" → A2DP 打不开（详细症状见 detect_sep 注释）。
-    #   本 ROM（realme GT5 Pro / PixelOS 17）实测 version=7.0，两种方法都得到空格；
-    #   但 Redmi K20 Pro 是 version=1.0 + 内容逗号，两者一致才没暴露此缺陷。
+    # 0. 根据根元素 version 确定输出列表格式。
     RV = detect_root_version(s)
     RSEP = sep_by_version(RV)
     RSRC = "version=" RV
@@ -441,8 +326,7 @@ END {
         if (RSEP == "") RSEP = ","
         RSRC = "探测(version 不可用)"
     }
-    # encodedFormats：APM 写死用空格（Serializer.cpp:568），与 version 无关。
-    #   这里不再探测 —— 探测若遇到逗号会写出 APM 切不开的混血列表。
+    # encodedFormats 固定使用空格。
     ESEP = " "
     printf "INFO: separator samplingRates=[%s] (%s) encodedFormats=[%s] (AOSP 固定)\n", \
            RSEP, RSRC, ESEP > "/dev/stderr"
@@ -491,16 +375,8 @@ END {
         if (needsfix(px[k])) needlhdc = 1
     }
 
-    # ★ 「已经是目标形态」的判据不能只看 devicePort。
-    #   光把端口摆进 bluetooth 是不够的 —— 软件编码通路还需要
-    #     ① 该 module 里有 mixPort "a2dp output"（APM 靠它开输出）
-    #     ② 每个 A2DP 端口都有 route 指向它
-    #   少任何一样，A2DP 输出都打不开（症状仍是无声）。
-    #   早先的判据只看 devicePort，于是「端口齐、LHDC 齐，但没有 a2dp output」
-    #   这种半成品会被判成「无需改动」而直接 exit 2，模块自检也看不出问题
-    #   —— 属于典型的假绿。
-    #
-    #   要判断目标 module 里已有什么，得先把它定位出来，所以下面先做定位。
+    # 完整策略必须同时具有 A2DP 端口、LHDC、a2dp output 和对应 route。
+    # 先定位现有或 include 中的目标 module，再判断是否需要修改。
     bthref = ""; inchtxt = ""; xipos = 0; xiend = 0
     if (bt == 0) find_bt_include()
 
@@ -570,16 +446,7 @@ END {
         if (q > 0) mi = indent_of(tgtbody, q)
     }
 
-    # 新的 devicePort 文本（补 LHDC、补齐采样率、重新缩进）
-    #
-    # ⚠️ 必须跳过**目标 module 里已经有**的同名端口。不做这个检查就会在同一个
-    #    module 内插出重复的 devicePort。重复可能来自两种来路：
-    #      - 本文件里已有 bluetooth module，且它自己也声明了同名端口（部分搬迁的 ROM）
-    #      - bluetooth module 来自被 include 的文件，而本文件 primary 下又声明了一份
-    #    AOSP 解析器对同名 devicePort 的行为未定义，routes 的 sink 也会指向歧义。
-    #
-    # ⚠️ 已经躺在目标 module 里、但缺 LHDC / 采样率不全的端口，由下面的
-    #    「就地修补」处理（情形一之变体 / 情形二），不在这里重复拼装。
+    # 只添加目标 module 尚不存在的端口；已有端口单独就地修补。
     np = ""
     for (k = 1; k <= pc; k++) {
         if (pm[k] == "bluetooth") continue
@@ -612,10 +479,7 @@ END {
         pos = e
     }
 
-    # 要补的 route：**所有**缺 route 的 A2DP 端口，不论它现在挂在哪个 module。
-    #   - 从 primary 搬进来的端口：需要新建 route
-    #   - 已经在 bluetooth 里但没有 route 的端口：同样需要补（否则输出打不开）
-    #   判据是 tgtbody 里有没有 sink 指向它，而不是它当前的 module。
+    # 为所有缺失路由的 A2DP 端口补充到 a2dp output 的连接。
     nrt = ""
     for (k = 1; k <= pc; k++) {
         if (has_attr_val(tgtbody, "sink", pn[k])) continue
@@ -638,10 +502,7 @@ END {
         cmp = index(bseg, "</mixPorts>")
         havemix = index(bseg, "name=\"a2dp output\"") > 0
 
-        # ★ 已经躺在 bluetooth module 里、但缺 LHDC / 采样率不全的端口要**就地补**。
-        #   原先只有 needsfix 触发的整块搬迁路径才会补 LHDC，已在模块内的端口被漏掉，
-        #   结果是「有端口、没 LHDC」—— 而模块自检只看 bluetooth module 是否存在
-        #   与 a2dp output 是否解析出采样率，于是这种漏补不会被发现。
+        # 修补 bluetooth module 内已有的 A2DP 端口。
         for (k = 1; k <= pc; k++) {
             if (pm[k] != "bluetooth") continue
             if (!needsfix(px[k])) continue
@@ -651,9 +512,7 @@ END {
 
         okd = 0; okr = 0; okm = 0
         if (havemix) okm = 1
-        # np/nrt 为空时不要调 insbefore —— 它会在收尾标签前留下一个空行。
-        # 为空的情况是真实存在的：目标 module 里已经有全部同名端口/route
-        # （去重后没有要插的），此时只需删掉 primary 下的副本。
+        # 没有待插入内容时保持原有段落不变。
         if (np != "" && cdp > 0) { if (insbefore(bs + cdp - 1, np, mi)) okd = 1 } else if (np == "") okd = 1
         if (nrt != "" && cdr > 0) { if (insbefore(bs + cdr - 1, nrt, mi)) okr = 1 } else if (nrt == "") okr = 1
         if (!havemix) { if (cmp > 0) { if (insbefore(bs + cmp - 1, MIXPORT, mi)) okm = 1 } }
@@ -673,14 +532,10 @@ END {
         if (hb == "") { print "ERR: cannot extract bluetooth module body from " bthref > "/dev/stderr"; exit 1 }
         hb = rebody(hb, mi)
 
-        # ★ 被吸收进来的模块自己可能已经声明了 A2DP 端口（AOSP 官方的
-        #   bluetooth_audio_policy_configuration.xml 就是如此）。那些端口同样
-        #   需要补 LHDC / 采样率；而 np/nrt 只负责**本文件里**要搬进来的端口
-        #   （且已按 tgtbody 去重），两者互不重叠。
+        # include 文件内已有的 A2DP 端口也需要检查格式和采样率。
         hb = fix_ports_in(hb)
 
-        # ★ mixPort 同理：被吸收的模块若已经声明了 a2dp output，就不要再插一份
-        #   （重复的 mixPort name 会让 APM 建出两个同名输出，行为未定义）。
+        # 已有 a2dp output 时不重复创建。
         if (index(hb, "name=\"a2dp output\"") == 0) {
             q = insert_before_close(hb, "</mixPorts>", MIXPORT)
             if (q != "") hb = q

@@ -10,16 +10,9 @@
 #   ./build.sh --no-check         跳过静态检查（不推荐）
 #   ./build.sh -h                 帮助
 #
-# 为什么要有这个脚本（手工 `zip -r ../x.zip .` 的三个坑）：
-#   1) 会把 .git / .gitignore 一起打进去 —— 体积翻倍，还可能泄露历史
-#   2) 会把从设备拉回来的取证文件（ap.txt / dumpsys.txt …）一起打进去
-#   3) 忘了 chmod —— zip 里脚本是 0644，装到设备上 post-fs-data.sh 没有 +x，
-#      init exec 失败 → 现象是「模块装了却毫无反应」（本项目真踩过）
-#
-# 本脚本的做法：
-#   文件清单来自 `git ls-files`（= 只有该进包的东西），排除构建脚本自身与 CI 配置；
-#   打包前对**将要进包的那批文件**做静态检查；打包后校验 zip 里 module.prop
-#   在根目录（多嵌一层目录会导致装不上）。
+# 清单来自 git ls-files；打包前做静态检查；打包后校验 module.prop 在 zip 根目录、
+# 权限位正确、不含 .git / state / 取证文件。条目顺序固定、权限显式 chmod，
+# 保证可复现构建。
 # ============================================================================
 set -euo pipefail
 
@@ -276,18 +269,8 @@ for f in "${FILES[@]}"; do
     cp -p -- "$f" "$STAGE/$f"
 done
 
-# 权限与 customize.sh 保持一致：目录 755，根目录脚本 755，数据/文档 644。
-# （设备侧 customize.sh 还会再补一次，这里做是为了 zip 本身也正确。）
-#
-# 这里是**全量显式设置**，不依赖源文件自身的权限位：`cp -p` 会原样保留源权限，
-# 而本机仓库和 CI（git checkout）里同一批文件的权限并不一致 ——
-# 本地常见 664/775（受 umask 与历史影响），CI 是 644/755。
-# 这个差异会被写进 zip 的条目属性，让「同一个 commit 在不同机器上构建」
-# 得到不同的 sha256，可复现性直接失效。
-#
-# 注意 `-maxdepth 1`：只有**根目录**那 4 个脚本由 init 直接 exec，需要 755；
-# lib/ 下的 common.sh 只是被 source，644 才是对的。
-# （写成 `find ... -name '*.sh'` 会把它一起设成 755，改成通用规则后更容易踩到。）
+# 权限显式设置，不依赖源文件自身权限位（本机与 CI 可能不同，会影响可复现性）。
+# 目录 755、根目录脚本 755、其余 644。-maxdepth 1 避免误把 lib/*.sh 设成可执行。
 find "$STAGE" -type d -exec chmod 755 {} +
 find "$STAGE" -type f -exec chmod 644 {} +
 find "$STAGE" -maxdepth 1 -type f -name '*.sh' -exec chmod 755 {} +

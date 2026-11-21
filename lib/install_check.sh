@@ -1,35 +1,16 @@
 #!/system/bin/sh
 # ============================================================================
 # install_check.sh — 安装期适用范围检查（只被 customize.sh 使用）
+# install_check.sh — 安装期适用范围检查（被 customize.sh source）
 # ----------------------------------------------------------------------------
-# 为什么要有它：
-#   本模块的适用范围很窄（Android 17 + audio.bluetooth.default.so + 策略文件里
-#   有 A2DP 端口）。不满足时装进去也不会出声，只会在 post-fs-data 里打一行
-#   SKIP 就退出 —— 用户看到的是「装成功了却毫无反应」，日志还藏在
-#   state/run.log 里，极难自查。所以把判定提前到安装阶段，并把结论直接打到
-#   root 管理器的安装控制台上：符合就继续装，不符合就 abort 并指明哪条不满足。
-#
-# 硬性要求（任一不满足 → 中止安装；FORCE=1 可强制继续）：
-#   1. awk 可用（补丁器 lib/patch_policy.awk 靠它执行）
-#   2. Android SDK >= MIN_SDK（默认 37）
-#   3. 找得到 audio.bluetooth.default.so
-#   4. 找得到候选 audio_policy_configuration.xml
-#   5. 补丁器对该文件**试运行**成功（退出码 0=可打补丁 / 2=已是目标形态）
-#
-# 软性提示（只警告，不阻止安装）：
-#   · /apex/com.android.bt 是否存在（AOSP 蓝牙栈形态）
-#   · busybox 是否可用于 mount --make-private（层隔离能力）
-#   · a2dp_offload.disabled 当前值（运行期会被自动纠正）
-#
-# 约束：本文件内**所有操作都必须只读**。调用方已把 DRY_RUN 置 1（common.sh 里
-#       所有写原语的总闸门），这里再自己保证不调用任何写函数 —— 检查失败时
-#       设备上除控制台输出外不应留下任何痕迹。
+# 硬性要求（任一不满足 → abort）：awk、SDK >= MIN_SDK、audio.bluetooth.default.so、
+# 候选策略文件、补丁器试运行成功（rc 0/2）。
+# 软性提示（仅警告）：/apex/com.android.bt、busybox、offload 属性。
+# 全程只读：调用方已设 DRY_RUN=1，本文件不调用任何写函数。
 # ============================================================================
 
 # ---------------------------------------------------------------- 控制台输出
-# Magisk / KernelSU / APatch 都提供 ui_print 与 abort；缺失时降级为 echo / exit 1。
-# ⚠️ 优先用 root 管理器自带的 abort：它会把安装标记为**失败**。只 exit 1 而不调
-#    abort 时，部分管理器会照旧把安装标成成功（目录已经解压完了）。
+# 优先用管理器的 ui_print/abort；abort 才会把安装标成失败，缺失时降级为 echo/exit 1。
 lc_ic_print() {
     if command -v ui_print >/dev/null 2>&1; then
         ui_print "$*"

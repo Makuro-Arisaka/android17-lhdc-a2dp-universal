@@ -1,667 +1,186 @@
-# LHDC A2DP Enabler (Android 17 universal)
+# LHDC A2DP Enabler
 
-A Magisk / KernelSU / APatch module that makes **Android 17's native LHDC** actually produce sound.
+A Magisk / KernelSU / APatch module for Android 17 that fixes the case where
+**headphones negotiate LHDC, but A2DP audio remains completely silent**.
 
-For devices in this situation: **LHDC negotiates successfully (`Current Codec: LHDCv5`) but there is no audio at all**.
+This module was made by `DeepSeek-V4.1-Flash (writing code)` and `Kimi-K3.1-Pro (writing documentation)`.
 
-This module was made by `DeepSeekV4.1Flash`.
+> [中文文档](README.md)
 
-> 中文版 / Chinese version: [README.md](README.md)
+## Scope
 
----
+This module targets devices using a hybrid **AOSP Bluetooth stack + Qualcomm PAL
+audio HAL** architecture:
 
-## What problem it solves
+- The AOSP Bluetooth stack does not establish a Qualcomm QTI HIDL session.
+- The Qualcomm offload path therefore cannot obtain its encoder configuration and
+  may repeatedly log `invalid encoder config` / `write error -22`.
+- The module routes A2DP through the AOSP software-encoding path so the system's
+  built-in LHDC encoder can be used.
 
-Android 17's AOSP Bluetooth stack ships an LHDC v5 software encoder (`lhdcv5BT_enc`). But many Qualcomm devices use a **hybrid architecture**:
+The module **only changes audio-policy routing; it does not supply an LHDC encoder**.
+It does not address headphone firmware, vendor encoder licensing, or unrelated
+A2DP/LE Audio failures.
 
-| Component | Implementation |
+### Requirements checked during installation
+
+| Requirement | Purpose |
 |---|---|
-| Bluetooth stack | AOSP (APEX `com.android.bt`) |
-| Audio HAL | Qualcomm PAL (`btaudio_offload_if.so` + QTI HIDL session) |
+| Android SDK ≥ 37 | Android 17 or later |
+| `awk` is available | Generates the patched policy |
+| `audio.bluetooth.default.so` exists | Provides the AOSP Bluetooth audio HAL |
+| A compatible audio policy is available | The installer performs a real patcher trial to check A2DP ports and output routes |
 
-A2DP has only two mutually exclusive paths:
+If a requirement is not met, installation stops and the root manager's installation
+console explains the exact reason.
 
-- **(a) QCOM offload**: the PAL drives the vendor BT HAL. This requires the Bluetooth stack to open a QTI HIDL session — which the AOSP stack **never** does, so it never obtains an encoder config, and the log floods with:
+`/apex/com.android.bt`, busybox, and offload properties are reported as supporting
+information. Missing busybox reduces mount-isolation reliability but does not by
+itself block installation.
 
-  ```
-  E PAL: Bluetooth: startPlayback: invalid encoder config
-  E PAL: StreamPCM: start: Rx device start failed with status -22
-  E AHAL: onWriteError: write error -22 (deep-buffer-playback)
-  ```
+MediaTek platforms, vendor-only Bluetooth audio implementations, and devices without
+a system LHDC encoder generally fall outside this module's scope. SoC branding alone
+is not decisive; inspect the HAL and actual audio policy.
 
-  The symptom is **continuous silence**, retried roughly every 50 ms.
+## Installation and removal
 
-- **(b) AOSP software encoding**: AudioPolicyManager opens the `a2dp output` of the AOSP Bluetooth audio HAL (`audio.bluetooth.default.so`) and hands PCM to the Bluetooth stack process for encoding.
-  **This is the only path that can run LHDC.**
+### Installation
 
-The stock policy declares A2DP ports **only** under the `primary` module (path (a)), so path (b) is unreachable. This module moves the A2DP ports into a separate `bluetooth` module (which maps to `audio.bluetooth.default.so`) and adds `AUDIO_FORMAT_LHDC` to them.
+1. Download a zip from [Releases](https://github.com/Makuro-Arisaka/android17-lhdc-a2dp-universal/releases),
+   or build it yourself as described below.
+2. Install it with Magisk / KernelSU / APatch and read the check results in the
+   installation console.
+3. Reboot so `post-fs-data.sh` can apply the policy before audioserver starts.
 
-```
-<module name="bluetooth" halVersion="2.0">   <- new; loads audio.bluetooth.default.so
-    mixPorts    : a2dp output
-    devicePorts : BT A2DP Out / Headphones / Speaker  (encodedFormats includes AUDIO_FORMAT_LHDC)
-    routes      : the three ports above -> a2dp output
-</module>
-```
-
-> The module **must** be named `bluetooth`: the HAL looks up `audio.<moduleName>.default.so`,
-> and these devices have no `audio.a2dp.default.so`.
-
----
-
-## How it works
-
-Because `/vendor` is usually physically read-only (forcing a write truncates the file to 0 bytes), this module **does not modify partition contents** — it overlays them at runtime with a bind mount:
-
-```
-state/golden/<key>.xml          -- pristine backup (sacred; never a mount source)
-        |
-        +- copy ------> state/work/<key>.<tag>.xml    --+
-        |                                              +--> bind mount -> target file
-        +- awk patch -> state/patched/<key>.<tag>.xml --+
-```
-
-`<tag>` = `<pid>.<epoch>`, **different on every apply** (see "unique tag" below).
-
-Why **two layers**: the bottom layer mounts the stock file, the top layer mounts the patch. If the top layer ever fails, the system still sees a parseable stock policy rather than an empty file. `work` is just a one-shot copy of `golden` that absorbs the "ghost mounts" produced by mount propagation, keeping `golden` permanently unpolluted.
-
-### ⚠️ Mounts must be made private, and toybox's `mount` cannot do it (key fix in v2.0.2)
-
-The source file lives on `/data`, and **`/data` is a member of a shared peer group**
-(`/data`, `/data/user/0`, `/data_mirror/*` are all in one group). Linux mandates:
-
-> A new mount bound from a subtree of a shared mount joins the peer group of the **source** mount.
-
-So the layer we mount at `/vendor/etc/...` also becomes a peer of `/data/user/0` and `/data_mirror/*`. Two consequences, both subtle:
-
-1. During boot, vold's mount/unmount of `/data/user/0` and `/data_mirror/*` **propagates** along the peer group and knocks our layer off → `post-fs-data` logs `RESULT: OK` while the `late_start` check reports `VERIFY BAD`
-2. The kernel duplicates a "ghost mount" over the **mount source path** itself, covering the source file; and `umount`ing that ghost propagates along the peer group, **taking the real patch layer down with it**
-
-**Big pitfall here: Android's built-in toybox `mount` does not support propagation options at all.**
-
-```
-$ mount --make-private /path
-mount: bad /etc/fstab: No such file or directory      <- toybox 0.8.13
-$ mount -o make-private /path
-mount: bad /etc/fstab: No such file or directory
-```
-
-Only **busybox's `mount`** supports them (both `--make-private` and `-o private` work), and Magisk ships `/data/adb/magisk/busybox`. So `lc_make_private()` tries in order:
-`$MODDIR/busybox` → `/data/adb/magisk/busybox` → `/data/adb/ksu/bin/busybox` → `/data/adb/ap/bin/busybox`,
-and if none is found it **degrades and warns honestly**, never pretending to succeed (v2.0.1 swallowed the error with `2>/dev/null`; the "(private)" line in the log was fake and the layer was actually running naked inside the peer group).
-
-Also, the mount source filename carries a **unique tag on every apply** (`<key>.<pid>.<ts>.xml`), so ghost mounts only ever land on names that are no longer in use — no need to unmount them (which is dangerous), and no risk of a later `cp`/`mv` writing into a covered old path.
-
-Three lines of defence; if any one fails it does not fail silently:
-
-1. **Immediate `lc_make_private()` on every layer** (the actual cure; needs busybox)
-2. **Uniquely tagged mount source name** — a ghost mount can never cover the file this run needs
-3. `lc_ensure_running()` in `service.sh` — inspects the runtime dump directly;
-   **`AUDIO_FORMAT_LHDC` never appears in a stock config**, so if it is missing, `setprop ctl.restart audioserver` reloads
-
-> #3 is the final safety net: as long as audioserver has read the stock config, it will be corrected.
-
-### ⚠️ List separators are decided by the root element's `version` (fix in v2.1.0; predicate corrected in v2.1.3)
-
-In AOSP's `audio_policy_configuration.xml`, the separator used by list-valued attributes is **not fixed** — it varies by ROM:
-
-| Attribute | Redmi K20 Pro / raphael | realme GT5 Pro / enzo | Redmi Note 12 Turbo / marble |
-|---|---|---|---|
-| root `version` | `1.0` (**inferred** from the rule below) | `7.0` (measured) | `7.0` (measured) |
-| `samplingRates` | **comma** `48000,96000` | space `48000 96000` | space `48000 96000` |
-| `channelMasks` | **comma** | space | space |
-| `encodedFormats` | space | space | space |
-
-> Note: the enzo and marble columns are measured from extracted images. The raphael `version`
-> was not sampled directly; it is **inferred** from "it uses commas" plus the rule below
-> (commas ⇒ it can only be `1.0`). Worth re-checking if a raphael stock XML ever becomes available.
-
-> **The separator style has nothing to do with the Android version — do not try to infer it from device or version.** All devices above are **Android 17 / SDK 37**, yet their styles differ. It depends on **who wrote that stock XML** (different vendor branch / ROM porting source).
-
-**The authoritative predicate (since v2.1.3)**: the separator for `samplingRates` / `channelMasks`
-is decided by the **root element's `version` attribute** — that is APM's own rule, in
-`frameworks/av/.../Serializer.cpp`:
-
-```cpp
-L251:  std::string mSamplingRatesSeparator = ",";                     // default
-L884:  if (version == "7.0" || version == "7.1") {
-L885:      mChannelMasksSeparator = mSamplingRatesSeparator = mFlagsSeparator = " ";
-L886:  } else if (version != "1.0") {  → error, file rejected
-```
-
-i.e. **`7.0`/`7.1` → space, `1.0` → comma.**
-
-> ⚠️ Why probing the stock file's own style is not enough: APM's behaviour is decided
-> **only by `version`**, regardless of what the file actually contains. If a ROM has
-> `version=7.0` while its content mistakenly uses commas, probing learns the wrong
-> separator while APM still splits on spaces → same silent failure.
-> So `version` is the **authoritative source**; `detect_sep()` is only a fallback for
-> when it cannot be read.
->
-> Also, `encodedFormats` does **not** follow `version`: AOSP hardcodes a space for it
-> (`Serializer.cpp:568`), so the patcher always joins it with spaces.
-
-v2.0.x's `patch_policy.awk` **hardcoded** spaces (copied from marble's style), so after porting to the K20 Pro it produced:
-
-```xml
-<!-- generated a2dp output (wrong - this ROM only accepts commas) -->
-<profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
-         samplingRates="44100 48000 88200 96000"
-         channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
-```
-
-**The fatal part is that it reports no error at all.** The parser just quietly degrades that profile to `[dynamic rates]` (empty sample-rate table), and it only blows up far away from the XML:
-
-```
-W APM_AudioPolicyManager: openOutputWithProfileAndDevice() missing param
-W APM_AudioPolicyManager: checkOutputsForDevice(): No output available for device 0080
-I AS.AudioDeviceInventory: APM failed to make available A2DP device addr=… error=1
-```
-
-→ the A2DP output can never be created → no profile available → **the A2DP device is permanently unavailable → Bluetooth is completely silent**.
-
-And the module's own LHDC check **stays green** — because `encodedFormats` is correct and only `samplingRates` broke, so nothing looks wrong in the logs. This bug stayed hidden all the way up to "put the headphones on, no sound".
-
-**The fix (two layers)**:
-
-1. `sep_by_version()` in `patch_policy.awk` decides the separator from the root `version`
-   (falling back to `detect_sep()` content probing only when `version` is missing or is not
-   `1.0/7.0/7.1`; AOSP canonical values only if both fail).
-   Every patch leaves one line on stderr so you can confirm what it used:
-
-   ```
-   INFO: separator samplingRates=[ ] (version=7.0) encodedFormats=[ ] (AOSP 固定)
-   INFO: separator samplingRates=[,] (version=1.0) encodedFormats=[ ] (AOSP 固定)
-   INFO: separator samplingRates=[ ] (探测(version 不可用)) encodedFormats=[ ] (AOSP 固定)
-   ```
-
-2. `lc_check_a2dp_profile()` **reconciles against the runtime dump** in the `service` stage:
-   the `a2dp output` section must show real `sampling rates:` values.
-   `AudioProfile::dump` prints the failing form as `sampling rates: [dynamic rates]`
-   — on one line — so the check tests for `[dynamic rates]` **first** and only then for
-   `sampling rates:`, and additionally rejects an empty value list.
-   (v2.1.0 had no such self-check, which is why the problem stayed hidden for so long;
-   the pre-v2.1.4 ordering also mis-reported the failing form as OK.)
-
-   > ⚠️ That self-check was itself a false-green. `AudioProfile::dump` prints the failing
-   > form on **one line**: `sampling rates: [dynamic rates]` (both format strings,
-   > `"%*ssampling rates: "` and `"[dynamic rates]"`, live in `libaudiofoundation.so`).
-   > The earlier predicate tested `*"sampling rates:"*` first, so the **failing form matched
-   > it** and was reported as "parsed correctly ✓" — one of the roots of the "self-check
-   > stays green" symptom this document keeps mentioning.
-
-### ⚠️ The "already in target form" predicate must not look at devicePort alone (key fix in v2.1.4)
-
-`patch_policy.awk` uses exit code 2 for "already in target form, nothing to do". The earlier
-predicate **only looked at the A2DP devicePorts** (are they all under the `bluetooth` module,
-do they all declare LHDC), so this half-finished shape was judged "nothing to do":
-
-```xml
-<!-- ports complete, LHDC declared, but no a2dp output outlet at all -->
-<module name="bluetooth" halVersion="2.0">
-    <devicePorts>
-        <devicePort tagName="BT A2DP Out" ... encodedFormats="... AUDIO_FORMAT_LHDC">…</devicePort>
-        <devicePort tagName="BT A2DP Headphones" .../>…
-    </devicePorts>
-    <!-- no <mixPort name="a2dp output">, no <routes> -->
-</module>
-```
-
-In that shape the A2DP output **still cannot be opened and is still silent**, yet the script
-declared "nothing to do" and exited.
-
-Since v2.1.4 the predicate requires **all three**:
-
-1. every A2DP devicePort lives under the `bluetooth` module
-2. every port declares `AUDIO_FORMAT_LHDC` (with a complete sample-rate list)
-3. the `a2dp output` mixPort **exists**, and every port has a route pointing at it
-
-Three related oversights were fixed alongside it (each produced malformed XML or missed a patch):
-
-| Scenario | Symptom |
-|---|---|
-| Some ports already under `bluetooth`, some still under `primary` | ports already inside the module were **inserted a second time** |
-| `bluetooth` module comes from `xi:include`, and the file also declares the same ports under primary | devicePort and route each **duplicated**, `a2dp output` could duplicate too |
-| Port already under `bluetooth` but **missing LHDC** | LHDC was only added on the "bulk move" path, so in-module ports were **missed** |
-
-In addition, `normrate()` now **rebuilds the whole list**: split by token → dedupe → add the
-canonical sample rates → rejoin with this ROM's separator. That also rescues pathological ROMs
-whose own file mixes both separators.
-
-### ⚠️ sku detection must be tiered: the platform name is not the sku name (key fix in v2.1.1)
-
-ROMs with a `sku_*` directory layout (common with Qualcomm PAL) ship several copies of `audio_policy_configuration.xml`, and only one of them is **actually loaded by this device**. Picking the wrong one raises no error — it just silently does nothing.
-
-v2.1.0 decided by **mixing a batch of properties into one string** and doing **substring** matching, so:
-
-```
-Redmi Note 12 Turbo / marble, real properties
-  ro.boot.product.vendor.sku = ukee      <- this is the sku name
-  ro.boot.hardware.sku       = marble    <- device name, not a sku
-  ro.board.platform          = taro      <- platform name! collides with sku_taro
-```
-
-The blob contained both `taro` and `ukee` → **two targets selected at once: `sku_taro` and `sku_ukee`** (one of them pure collateral). A platform name will eventually collide with some other sku directory name, so v2.1.1 splits the hints into two tiers:
-
-| Tier | Properties | Matching | Accepted when |
-|---|---|---|---|
-| **Authoritative** | `ro.boot.product.vendor.sku` → `ro.boot.sku` → `ro.vendor.sku` → `ro.vendor.build.sku` → `ro.boot.hardware.sku` → `ro.boot.product.hardware.sku` | split on `_`/whitespace, then **whole-word** equality (`ukee_cdp` also matches `ukee`) | **exactly 1 hit**; several hits fall through to the next property |
-| **Weak hints** | `ro.board.platform` / `ro.hardware` / `ro.soc.model` / `ro.boot.device` / `ro.product.device` / `ro.boot.hardware` | whole-word first, substring only as fallback | used only when the authoritative tier yields nothing |
-
-If the authoritative tier yields nothing and the weak hints give nothing either, it still falls back to **patching everything** under `PATCH_ALL=1`
-(adding a `bluetooth` module to a non-active sku is harmless and safer than betting on the wrong one).
-
-The hit is written to the log: `INFO: sku 由 ro.boot.product.vendor.sku=ukee 判定 → sku_ukee`
-
-> Also fixed a subtle bug that **only struck with `VERBOSE=1`**: `lc_log()`'s verbose echo used to go to stdout, while functions like `lc_pick_targets()` capture return values from stdout via `$(...)` — so log lines were mistaken for "target paths" and mixed into `$targets`, leading to mounts of nonexistent paths. Now it echoes to **stderr**.
-> The lesson is the same as the separator one: **a channel that carries both results and logs will bite you eventually.**
-
-### Automatic flow
-
-`post-fs-data` (before audioserver):
-
-1. **Pre-check** — SDK ≥ 37 and `audio.bluetooth.default.so` present, otherwise skip (no forcing)
-2. **Correct the property** — if `persist.bluetooth.a2dp_offload.disabled` is `true`, set it back to `false`
-   (**when true, A2DP is completely silent**)
-3. **Locate the target** — see below
-4. **Back up the stock file** — only accepts "unpatched" content; if the visible content is already patched, it reads the partition's original file directly
-   (`mount --bind` copies a single filesystem without submounts, so the real uncovered file can still be read)
-5. **Patch** — `lib/patch_policy.awk` (POSIX awk; Android's toybox awk suffices).
-   Before writing list attributes it **probes the stock file's separator style** and writes accordingly (see previous section)
-6. **Two-layer mount**, each layer followed immediately by `--make-private`, then remove the ghost mount on the source path
-
-`service` (late_start):
-
-- Verify the overlay; redo it once if not in effect
-- **Runtime verification** — if `dumpsys media.audio_policy` contains no `AUDIO_FORMAT_LHDC`, audioserver still loaded the stock config, so `setprop ctl.restart audioserver` makes it reload
-- **Sample-rate parsing self-check** — confirm that the `a2dp output` profile really parsed `sampling rates:`
-  (rather than `[dynamic rates]`). This one specifically catches **silent failures** like a wrong separator style
-- **Reverse-look up which policy file the running audioserver actually loaded**, store it in `state/active.path`, and hit it directly on next boot
-- Export the stock backup to `/sdcard/lhdc-a2dp-backup/`
-
-### Target resolution order
-
-1. `state/active.path` (the active file reverse-looked-up on last boot)
-2. Config item `SKU=<name>` to force it
-3. **Authoritative sku properties**, tried one by one in priority order, accepted on **exactly one** hit:
-   `ro.boot.product.vendor.sku` → `ro.boot.sku` → `ro.vendor.sku` → `ro.vendor.build.sku`
-   → `ro.boot.hardware.sku` → `ro.boot.product.hardware.sku` (whole-word match, see previous section)
-4. **Weak hints** (platform name / SoC name / device name), whole-word first, substring as fallback
-5. Only one candidate → use it
-6. Several and undecidable → **patch all** (`PATCH_ALL=1`). Patching the ones that are not loaded has no side effect, so this is a safe fallback
-
----
-
-## Requirements
-
-**These are checked at install time.** If any hard requirement is not met, the install
-is aborted and the root manager's install console says which one failed — you never get
-"installed successfully but nothing happens":
-
-```
-****************************************
- LHDC A2DP Enabler — pre-install requirement check
-****************************************
- module : android17-lhdc-a2dp-universal v2.1.4
- device : marble / 22122RK93C
- vendor : Xiaomi/marble/marble:17/...
- config : MIN_SDK=37 FORCE=0 SKU=(auto) PATCH_ALL=1
-
- [OK] awk patcher      : /system/bin/awk
- [OK] Android SDK      : 37 (requires >= 37)
- [OK] Bluetooth HAL    : /vendor/lib64/hw/audio.bluetooth.default.so
- [OK] Policy file      : 1 candidate found
-        · /vendor/etc/audio/sku_ukee/audio_policy_configuration.xml
-          -> patchable
-          -> INFO: separator samplingRates=[ ] (version=7.0) encodedFormats=[ ] (AOSP fixed)
- [OK] AOSP BT stack    : /apex/com.android.bt
- [OK] Propagation tool : /data/adb/magisk/busybox
- [--] offload props    : supported=true disabled=false
-----------------------------------------
- Result: within scope -> continue installation
- Note: a successful install does NOT mean audio already works. After reboot,
-       post-fs-data patches and mounts it; see "Verifying it works" in the README.
-```
-
-Hard requirements (any failure aborts the install):
-
-| # | Condition | How to check | If not met |
-|---|---|---|---|
-| 1 | awk is available | `command -v awk` | Abort: without awk the patched policy cannot be generated |
-| 2 | Android 17+ (SDK 37) | `getprop ro.build.version.sdk` | Abort: no LHDC encoder exists (set `MIN_SDK` / `FORCE=1` to force) |
-| 3 | `audio.bluetooth.default.so` exists | `ls /vendor/lib64/hw/audio.bluetooth.default.so` | Abort: the new module cannot load (can force with `FORCE=1`) |
-| 4 | The policy file has A2DP ports | `grep 'BT A2DP' <policy file>` | Abort: the patcher trial run reports `no A2DP devicePort found` |
-
-Requirement 4 is a **trial run**, not a grep: the installer actually runs the patcher
-on every candidate policy file (stdout discarded, only the `separator` stderr line is
-kept). Exit code `0` (patchable) or `2` (already the target shape) passes. That way even
-"readable but structurally broken" files are stopped at install time.
-
-Soft signals only warn:
-
-| Signal | Why it does not block |
-|---|---|
-| `/apex/com.android.bt` missing | The criterion is the HAL, not where the stack lives; some ROMs differ |
-| No usable busybox | The overlay cannot be made private; reliability drops but a runtime fallback exists |
-| `a2dp_offload.disabled=true` | `OFFLOAD_FIX=1` corrects it at boot |
-
-**Not applicable**: devices that lack the encoder itself (`lhdc_codec_support=FALSE`, or Android < 17).
-**This module only routes audio to the correct HAL path; it does not provide an encoder.**
-
-### Does it work on MTK / MediaTek?
-
-Basically no — but the criterion is items 2 and 3 above, **not "which vendor made the SoC"**:
-
-- MTK devices use MediaTek's own audio HAL; there is **no Qualcomm PAL**, and no `btaudio_offload_if.so` / QTI HIDL session. The broken link this module fixes (AOSP stack not opening a QTI session → no encoder config) **simply does not exist on MTK**
-- So there is no need to move A2DP ports into a `bluetooth` module either: what Qualcomm platforms lack is the software encoding path, whereas MTK's A2DP goes through its own HAL — moving it could actually kill the sound
-- A few MTK devices do carry `audio.bluetooth.default.so` (the generic AOSP Bluetooth audio HAL, usually packaged for LE Audio / hearing aids), but that **does not mean** their A2DP goes through it
-
-"LHDC negotiated but silent" on MTK usually has different causes: the vendor never enabled LHDC on that model, a Bluetooth firmware/middleware version mismatch, or MTK's own offload configuration — none of which this module can fix. Look for a ROM- or kernel-side solution for that specific model.
-
-> If unsure, run `--dry-run`: it only reports, never changes anything. The SDK, HAL, and candidate-policy sections are enough to settle it.
-
-No root-side barrier: Magisk / KernelSU / APatch all work (only `post-fs-data.sh` + `service.sh` are used;
-**no `system/` directory overlay** — KernelSU does not support that natively).
-
----
-
-## Configuration
-
-Edit `lhdc.conf` in the module directory; takes effect on next boot:
-
-| Key | Default | Meaning |
-|---|---|---|
-| `SKU` | empty | Force a sku directory name (`ukee` / `taro` / `kalama` …); empty = auto-detect |
-| `PATCH_ALL` | `1` | Whether to patch all candidates when the active sku cannot be determined |
-| `OFFLOAD_FIX` | `1` | Whether to correct `a2dp_offload.disabled` (**recommended: keep 1**) |
-| `FORCE` | `0` | Skip the pre-checks (**including at install time**); do not enable unless necessary |
-| `MIN_SDK` | `37` | Skip outright below this SDK; the install-time check uses the same value |
-| `VERBOSE` | `0` | Extra output to stdout |
-| `LHDC_DUMPSYS_TIMEOUT` | `20` | Per-call `dumpsys` timeout (seconds). Lower it if the device is dragged to high load by **other** faults; do not set 0 |
-
----
-
-## Diagnostics
+You can also install through the KernelSU command line:
 
 ```sh
-# Report only - changes nothing
+adb push android17-lhdc-a2dp-universal.zip /data/local/tmp/
+adb shell su -c 'ksud module install /data/local/tmp/android17-lhdc-a2dp-universal.zip'
+```
+
+The installation check is read-only. Script permissions and stale runtime data are
+handled only after the check succeeds. `FORCE=1` skips the scope checks, but bypassing
+them does not make LHDC available on an incompatible device.
+
+### Removal
+
+Remove the module in your root manager. The uninstall script will:
+
+1. Remove the audio-policy mounts created by this module.
+2. Check the original files on their partitions.
+3. Clean up module runtime data and backups.
+
+Stock backups are stored in `state/golden/` within the module directory and are also
+exported to `/sdcard/lhdc-a2dp-backup/` during normal operation. The original
+partition files normally need no restoration because the module never rewrites them.
+
+## Verification and diagnostics
+
+After rebooting, check audioserver's active policy rather than relying only on the
+module's enabled status.
+
+### 1. A2DP output and sampling rates
+
+```sh
+su -c 'dumpsys media.audio_policy' | grep -A5 '"a2dp output";'
+```
+
+The output should contain `a2dp output` and explicit sampling rates, for example:
+
+```text
+sampling rates: 44100, 48000, 88200, 96000
+```
+
+`[dynamic rates]` indicates an incorrect list separator or XML profile parsing
+problem; the A2DP output may then fail to open.
+
+### 2. Bluetooth codec and playback status
+
+```sh
+dumpsys bluetooth_manager | grep -i 'Current Codec'
+logcat -b all -d | grep -i lhdc
+logcat -b all -d | grep -E 'invalid encoder config|write error -22|PAL: Bluetooth: startPlayback'
+```
+
+The headphones should negotiate LHDC. If the errors matched by the last command keep
+appearing during playback, audio is still using the broken Qualcomm offload path.
+
+### 3. Read-only diagnostics
+
+```sh
 su -c 'sh /data/adb/modules/android17-lhdc-a2dp-universal/post-fs-data.sh --dry-run'
 ```
 
-The output covers: SDK, whether the HAL is in place, whether awk is usable, the offload property, all candidate policy files and their state, the selected target, the stock files backed up in state, **per-layer mount state (with propagation mode and mount source)**, the propagation mode of the source-side parent mount, whether a private-capable tool is available, **runtime state (whether audioserver really loaded the patched policy)**, and recent logs.
+The report includes the SDK, HAL, policy files, selected targets, mount propagation
+modes, and recent logs. Logs are stored in `state/run.log` in the module directory;
+timestamps from early boot may not yet be synchronized.
 
-```
-=== android17-lhdc-a2dp-universal 诊断 ===
-SDK            : 37  (MIN_SDK=37, FORCE=0)
-AOSP BT HAL    : yes
-awk            : awk
-offload 属性   : supported=true disabled=
---- 候选策略文件 ---
-  vendor_etc  [31761 B]  已补丁
---- 选中的目标 ---
-  /vendor/etc/audio_policy_configuration.xml
---- state 目录 ---
-  vendor_etc.md5  (33 B)
-  vendor_etc.xml  (30734 B)
---- 当前挂载层（[传播模式] 挂载点 ← 源） ---
-  [private] /vendor/etc/audio_policy_configuration.xml
-                  ← /vendor/etc/audio_policy_configuration.xml   ← 应为 [private] ×2
-  [private] /vendor/etc/audio_policy_configuration.xml
---- 源侧传播模式（shared 是危险信号） ---
-  /vendor/etc/audio_policy_configuration.xml  ← 父挂载 shared
---- 传播隔离能力 ---
-  private 工具: /data/adb/magisk/busybox （busybox，支持 --make-private）
---- 运行态（audioserver 是否真的加载了补丁策略） ---
-  OK — 运行中的策略含 AUDIO_FORMAT_LHDC
-```
+## Configuration
 
-> The output above is verbatim from a real device (the script prints Chinese), so you can match it line by line on your own device.
+Edit [`lhdc.conf`](lhdc.conf) in the module directory. Changes normally take effect
+after the next reboot.
 
-**How to read this report:**
+| Setting | Default | Purpose |
+|---|---:|---|
+| `SKU` | empty | Manually select a `sku_*` name; leave empty for automatic detection |
+| `PATCH_ALL` | `1` | Process every candidate when the active SKU cannot be determined |
+| `OFFLOAD_FIX` | `1` | Change `persist.bluetooth.a2dp_offload.disabled=true` back to `false` |
+| `FORCE` | `0` | Skip scope checks during installation and boot |
+| `MIN_SDK` | `37` | Minimum Android SDK |
+| `VERBOSE` | `0` | Print additional debugging information |
+| `LHDC_DUMPSYS_TIMEOUT` | `20` | Timeout in seconds for each `dumpsys` call; do not set it to `0` |
 
-| Line | Expected | Meaning |
-|---|---|---|
-| `AOSP BT HAL` | `yes` | Without it there is no software encoding path |
-| `当前挂载层` (current mount layers) | both layers `[private]` | `[shared]` means the layer is not isolated and can be knocked off by `/data` mount events at any time |
-| `源侧传播模式` (source-side mode) | `shared` (**normal**) | This is the **parent mount** (`/vendor`), and explains **why** we must go private |
-| `传播隔离能力` (isolation capability) | busybox present | toybox's `mount` lacks `--make-private`; without busybox the layer cannot be locked down |
-| `运行态` (runtime state) | `OK` | A stock config never contains `AUDIO_FORMAT_LHDC`; its presence proves audioserver read the patched version |
+Target policies are located in this order: previously learned active path → manual
+`SKU` → authoritative SKU properties → platform/device hints → sole candidate →
+all candidates when `PATCH_ALL=1`.
 
-> The "source-side mode" and "current mount layers" lines are not contradictory: the former is about the parent mount (`/vendor`, permanently shared — you cannot and should not change it), the latter about **the layer we mount ourselves** (which must be private).
+## Implementation overview
 
-Log file: `/data/adb/modules/android17-lhdc-a2dp-universal/state/run.log`
-(note: early-boot timestamps read `1970-…` because the RTC is not yet synced — judge ordering by line sequence, not timestamps)
+The module does not rewrite `/vendor` or other partitions. It keeps files under the
+module's `state/` directory and bind-mounts them:
 
----
-
-## Verifying that it works
-
-```sh
-# 0. The most important one: does the running policy contain LHDC?
-#    A stock config never contains AUDIO_FORMAT_LHDC; its presence means audioserver loaded the patched version
-su -c 'dumpsys media.audio_policy | grep -c AUDIO_FORMAT_LHDC'
-#    expect >= 1 (once per A2DP port, plus profile copies)
-
-# 0b. Equally important and more subtle: did the a2dp output sample rates really parse?
-#     With the wrong separator style this degrades to [dynamic rates] while the check above stays green
-su -c 'dumpsys media.audio_policy' | grep -A5 '"a2dp output";'
-#    expect "sampling rates: 44100, 48000, 88200, 96000"
-#    "[dynamic rates]" instead -> A2DP output cannot open, Bluetooth silent (see "separators must follow the ROM")
-
-# 1. Audio HW modules: primary should no longer hold A2DP ports; they belong to bluetooth
-su -c 'dumpsys media.audio_policy | grep "Handle: "'
-
-# 2. The target file should contain the bluetooth module + LHDC
-su -c 'grep -c "module name=\"bluetooth\"" /vendor/etc/audio/sku_*/audio_policy_configuration.xml'
-
-# 3. Our layer must be private (shared means it can still be knocked down by /data events)
-su -c 'grep audio_policy_configuration /proc/self/mountinfo'
-
-# 4. Headset negotiation result
-dumpsys bluetooth_manager | grep -i "Current Codec"      # expect LHDCv5
-
-# 5. While playing: confirm the encoder runs and there are no fault logs
-logcat -b all -d | grep -i lhdcv5
-logcat -b all -d | grep -cE "invalid encoder config|write error -22|PAL: Bluetooth: startPlayback"
-#    expect 0
+```text
+Stock XML → state/golden/       stock backup
+          ├→ state/work/        stock fallback mount layer
+          └→ state/patched/     patched mount layer
 ```
 
-> ⚠️ That `PAL: Bluetooth: startPlayback` line **is a genuine fault signal** (the PAL retrying a stream that failed to start), not harmless verbose output. It is the best indicator of "connected but silent".
+- `customize.sh`: installation checks, permission fixes, and stale runtime-data cleanup.
+- `post-fs-data.sh`: policy discovery, backup, patch generation, and mounting.
+- `service.sh`: file and audioserver verification, active-policy learning, and backup export.
+- `uninstall.sh`: mount removal, original-file checks, and runtime-data cleanup.
+- `lib/patch_policy.awk`: A2DP port migration and completion of LHDC,
+  `a2dp output`, and route declarations.
 
----
+The patcher selects list separators from the XML root's `version`: commas for `1.0`
+and spaces for `7.0`/`7.1`. `encodedFormats` always uses spaces. Where busybox is
+available, mount layers are made private to reduce the risk of shared-mount
+propagation removing the patched layer.
 
-## Porting to another device
+## Development and building
 
-The module itself is generic (auto-locates sku, auto-backs-up, auto-patches), but you still need to confirm:
-
-1. **SDK ≥ 37** and **the AOSP Bluetooth stack directory `/apex/com.android.bt` exists**
-2. **`audio.bluetooth.default.so` exists** (requirement #3 above)
-3. **The architecture is hybrid**: `grep -rl btaudio_offload /vendor/lib64 | head`
-   If the device is already pure AOSP, it does not need this module
-4. **The stock policy's A2DP ports are not already under `primary`**
-   — if they are already in a `bluetooth` module, the module only adds LHDC and does not restructure anything
-
-If the target's sku directory name cannot be matched by properties and there are several candidates, the module patches all of them by default; you can also hardcode `SKU=` in `lhdc.conf`.
-
-### The two things to confirm first on a new device
-
-```sh
-# 1. Is there a usable busybox? (determines whether layers can be made private)
-ls -l /data/adb/magisk/busybox /data/adb/ksu/bin/busybox /data/adb/ap/bin/busybox 2>/dev/null
-/data/adb/magisk/busybox mount --make-private /some/mountpoint   # no error = usable
-
-# 2. Is the source-side mount shared? (almost always yes - normal, the module handles it)
-awk '$5=="/data"{print $0}' /proc/self/mountinfo
-#    look for shared:NN at the end - present means a peer group is involved
-```
-
-As long as the source file sits on a shared mount, the bound layer joins that peer group.
-The module breaks this with an **immediate `lc_make_private()` on each layer (via busybox)**.
-Should a device lack busybox entirely, the module degrades: the layers stay in the peer group,
-but the **uniquely tagged source filename** guarantees no file is written wrong, and
-`lc_ensure_running()` in `service.sh` still restarts audioserver when it reads the wrong config.
-
----
-
-## Troubleshooting: boot hangs / never finishes (**rule this module out first**)
-
-Symptom: after reboot the device sits on the boot animation for a long time, `getprop sys.boot_completed` **stays empty**, but the shell works and `/proc/uptime` keeps increasing (so **the device is not dead — boot simply never completed**).
-
-**Do this first** — it takes a second and tells you whether this module is at fault:
-
-```sh
-adb shell getprop sys.init.updatable_crashing     # empty = normal; 1 = some other service is crashing
-adb shell "su -c 'dmesg | grep -c dspservice'"    # on this K20 Pro it crashed every 5 seconds
-```
-
-`sys.init.updatable_crashing=1` means **init's "updatable component crashed 4 times before boot_completed" recovery kicked in** (`apexd` will try to roll that APEX back). That has nothing to do with this module — the module only rewrites one `audio_policy_configuration.xml` and cannot make any other native process take a `SIGSYS`.
-
-### Real case (Redmi K20 Pro / raphael, Android 17 ported ROM)
-
-```
-[ 9.70] init: Service 'vendor.dspservice' (pid 1331) received SIGSYS     <- killed ~100ms after start
-[14.63] init: Service 'vendor.dspservice' (pid 2483) received SIGSYS     <- every 5 seconds, forever
-[21.68] init: processing action (sys.boot_completed=1)                   <- the successful one: it won the race
-```
-
-- The process takes a `SIGSYS` about 100 ms after exec, **every single time** → classic **seccomp policy mismatch** (old vendor binary + new system)
-- **Completely unrelated to this module**: in the same boot, this module's
-  `post-fs-data → RESULT: OK` and `late_start → VERIFY OK` were both normal
-- **What decides whether boot succeeds is a race**:
-  - `boot_completed` finished at **21.7s**; dspservice's 4th crash was at **24s**
-    → a **~2.3 second** margin; this round passed by luck
-  - If boot is just 2.5 seconds slower than usual, the 4th crash lands before `boot_completed`,
-    triggering `updatable_crashing` + `apexd` rollback → **boot hangs permanently, with no auto-restart**
-
-In other words: **this device hangs on any boot that is "a bit slow" at the system level, regardless of this module.** To stop the random hangs you must fix that crashing vendor service (patch/replace its seccomp policy, or mask the service) — do not look for the cause in this module.
-
-### How to recover once it hangs
-
-```sh
-# 1) Save the scene first (dmesg is cleared on reboot - critical)
-adb shell "su -c 'dmesg > /data/local/tmp/dmesg.log'"
-
-# 2) All normal reboot paths fail - don't waste time on them:
-#      adb reboot                    -> hangs (goes through system_server)
-#      setprop sys.powerctl reboot   -> blocked by SELinux, and reads back empty
-#      /proc/sysrq-trigger           -> sysrq disabled (/proc/sys/kernel/sysrq = 0)
-#    Only the binary that calls reboot(2) directly works, and **give it plenty of time (30s+)**:
-adb shell "su -c '/system/bin/reboot'"
-```
-
-> Forensics pitfall: `setprop sys.powerctl reboot` returns 0 but **the property is never actually written**
-> (reading `getprop sys.powerctl` back gives empty). **Do not judge success by the return code — read it back.**
->
-> Also: pipelines like `ps -o STAT,NAME | awk | sort | uniq -c` hang together when the system is wedged;
-> use the simplest single commands while debugging.
-
----
-
-## Uninstall
-
-Just remove the module in your root manager. `uninstall.sh` will:
-
-1. Take down the overlay so the real file on the partition becomes visible again
-2. Check whether it is intact; **if not**, it temporarily holds things together with the stock backup in `state/golden/`
-   and tells you to reflash vendor before rebooting
-
-Where the stock backup lives:
-- On device: `/data/adb/modules/android17-lhdc-a2dp-universal/state/golden/`
-- Retrievable anytime: `/sdcard/lhdc-a2dp-backup/` (exported automatically after boot)
-
----
-
-## Directory layout
-
-```
-android17-lhdc-a2dp-universal/
-├── module.prop            module declaration
-├── lhdc.conf              user configuration
-├── customize.sh           install time: check requirements first (abort if not met), then fix permissions
-├── post-fs-data.sh        early boot: locate -> back up -> patch -> mount
-├── service.sh             after boot: verify / reverse-look-up active policy / export backup
-├── uninstall.sh           uninstall: take down mounts + check original file + hold if needed
-├── lib/
-│   ├── common.sh          shared library (locate, back up, patch, mount)
-│   ├── install_check.sh   install-time requirement check (read-only, prints to install console)
-│   └── patch_policy.awk   XML patcher (POSIX awk)
-├── tests/                 local regression tests (**not packaged**)
-│   ├── run-install-check.sh
-│   └── fixtures/          minimal policy XML samples
-├── .github/
-│   ├── workflows/release.yml   push a v* tag -> auto build + release (**not packaged**)
-│   └── RELEASE_TEMPLATE.md     release notes template (**not packaged**)
-├── build.sh               packaging script (**for developers, not packaged**)
-├── README.md              documentation (Chinese)
-├── README.en.md           documentation (English, **not packaged**)
-├── LICENSE                GPL-3.0 full text
-└── state/                 generated at runtime: backups and logs (**not packaged**)
-```
-
----
-
-## Building and packaging
+Always package the module with `build.sh`. It checks required files, LF line endings,
+shell/awk syntax, zip structure, and file permissions, then produces a SHA-256 file:
 
 ```bash
-./build.sh                      # -> ../android17-lhdc-a2dp-universal.zip + .sha256
-./build.sh --reproducible       # reproducible: same commit yields a byte-identical zip
-./build.sh -o /tmp/xx.zip       # custom output path
-./build.sh --allow-dirty        # allow building with uncommitted changes
-./build.sh -h                   # all options
+./build.sh
+./build.sh --reproducible       # reproducible build for the same commit
+./build.sh -o /tmp/module.zip   # choose the output path
+./build.sh --allow-dirty        # build with working-tree changes
 ```
 
-**Do not `zip -r` by hand** — three pitfalls:
-
-| Pitfall | Consequence |
-|---|---|
-| Including `.git/` and `.gitignore` | Doubles the size and may leak history |
-| Including `state/`, `ap.txt`, `dumpsys.txt`, etc. | Unclean package; forensic files may contain your device info |
-| Forgetting `chmod 755` | On device, `post-fs-data.sh` has no `+x`, init's exec fails — symptom is **"module installed but nothing happens"**, with not a single log line |
-
-What `build.sh` does:
-
-- **The file list comes from `git ls-files`** — only what should be packaged gets packaged, no hand-written blacklist
-  (outside a git repo it falls back to `find` + blacklist mode)
-- **Refuses to build with a dirty worktree** (uncommitted/untracked changes would make the artifact diverge from the repo state);
-  `--allow-dirty` overrides this and explicitly warns that "untracked files starting with `??` will not be packaged"
-- **Static checks**: required files present, line endings must be LF (CRLF rejected outright), no BOM,
-  `busybox ash -n` syntax check (close to the device-side shell), `*.sh` syntax, awk script syntax
-- **Post-build self-check**: `module.prop` must be at the zip **root** (an extra nesting level makes it uninstallable),
-  no `.git` / `state/` mixed in, in-zip permission bits must be 755 for scripts / 644 for data
-- Also emits `.sha256` so you can verify that "the package on the device == this commit"
-
-Installing the package:
+The installation checks can be regression-tested on a development machine using a
+simulated device environment:
 
 ```bash
-adb push ../android17-lhdc-a2dp-universal.zip /data/local/tmp/
-adb shell su -c 'ksud module install /data/local/tmp/android17-lhdc-a2dp-universal.zip'   # KernelSU
-# Magisk: choose "Install from storage" and pick the zip
+bash tests/run-install-check.sh
 ```
 
-KernelSU puts it into `modules_update/` first; **it only becomes active after a reboot**. This project also keeps a copy on `/sdcard/` by convention.
-
-### Downloading prebuilt packages (Releases)
-
-If you would rather not build it yourself, grab the assets from [Releases](/Makuro-Arisaka/android17-lhdc-a2dp-universal/releases):
-
-| Asset | Description |
-|---|---|
-| `android17-lhdc-a2dp-universal.zip` | The module package — install directly |
-| `android17-lhdc-a2dp-universal.zip.sha256` | Checksum |
-
-These are built by GitHub Actions running `./build.sh --reproducible` on the corresponding commit, **not hand-uploaded binaries**:
-timestamps come from the commit time, so the same commit produces byte-identical output on any machine — you can
-
-```bash
-git checkout v2.1.1 && ./build.sh --reproducible
-```
-
-reproduce the same sha256 yourself, to confirm the asset really came from that commit's source.
-
----
+`tests/`, build scripts, and CI files are excluded from the module package. To publish
+a new version, increment `version` / `versionCode` in [`module.prop`](module.prop),
+commit the change, and push a `v*` tag. GitHub Actions then builds the Release.
 
 ## License
 
-**GNU General Public License v3.0** (full text in [LICENSE](LICENSE)).
-
-> At runtime this module overlays system configuration with a bind mount and **never rewrites the original files on any partition**; the device returns to its original state after uninstalling. The license covers the code and documentation in this repository.
+[GNU General Public License v3.0](LICENSE)

@@ -14,11 +14,8 @@ LHDC_CONF=$MODDIR/lhdc.conf
 LHDC_AWK=""
 
 # ---------------------------------------------------------------- 用户配置
-# 优先级：命令行/环境变量 > lhdc.conf > 这里的默认值
-#
-# ⚠️ 一律用 ${VAR:-} 取值，不能写 $VAR：本文件会被 customize.sh 在**安装期**
-#    source，而不同 root 管理器启动安装脚本时的 shell 选项并不一致（有的带
-#    `set -u`）。裸 $VAR 在 nounset 下会直接报「未绑定的变量」让整个安装失败。
+# 优先级：环境变量 > lhdc.conf > 默认值。
+# 安装环境的 shell 可能启用 nounset，因此使用 ${VAR:-} 读取可选变量。
 __env_SKU=${SKU:-}; __env_PATCH_ALL=${PATCH_ALL:-}; __env_OFFLOAD_FIX=${OFFLOAD_FIX:-}
 __env_FORCE=${FORCE:-}; __env_MIN_SDK=${MIN_SDK:-}; __env_VERBOSE=${VERBOSE:-}
 __env_DT=${LHDC_DUMPSYS_TIMEOUT:-}
@@ -52,12 +49,7 @@ LC_ECHO=0
 [ "$VERBOSE" = 1 ] && LC_ECHO=1
 
 # ---------------------------------------------------------------- 基础工具
-# DRY_RUN：置 1 时所有**写操作**都必须跳过（post-fs-data.sh --dry-run）。
-# ⚠️ 为什么不只靠「不调用写函数」：--dry-run 走的是 lc_report，而 lc_report 会
-#    间接调到 lc_pick_targets / lc_learn_active 等，它们内部自带
-#    mkdir -p "$LHDC_STATE"、>> "$LHDC_LOG"、rm -f active.path 这类写操作。
-#    只靠"报告路径上别调写函数"是守不住的 —— 一旦以后有人给 lc_report 加一行
-#    查询，副作用就会悄悄回来。所以把闸门放在最底层的写原语上。
+# DRY_RUN=1 禁止写文件、日志及 learned path，包括诊断间接调用的函数。
 DRY_RUN=${DRY_RUN:-0}
 
 lc_log() {
@@ -65,10 +57,7 @@ lc_log() {
         [ -d "$LHDC_STATE" ] || mkdir -p "$LHDC_STATE" 2>/dev/null
         echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LHDC_LOG" 2>/dev/null
     fi
-    # ⚠️ verbose 回显必须走 **stderr**：lc_pick_targets / lc_find_candidates 等
-    #    函数的返回值是走 stdout 的（调用方用 $(...) 捕获）。回显若走 stdout，
-    #    开着 VERBOSE 时日志行会被当成目标路径混进 $targets，去挂一堆不存在的
-    #    路径 —— 而且只在开了 verbose 的时候发作，极难查。
+    # stdout 保留给函数返回值，诊断信息只能写 stderr。
     [ "$LC_ECHO" = 1 ] && echo "$*" >&2
     return 0
 }
@@ -83,23 +72,11 @@ lc_rotatelog() {
     return 0
 }
 
-# 把绝对路径映射成一个「文件名安全」的键，用于 golden/ patched/ work/ 下的文件名。
-#
-# ⚠️ 这个映射必须是**单射**（不同路径绝不能得到同一个键）。
-#    早先直接 `s|/|_|g`，于是目录名里本来就有的下划线会被误当成分隔符：
-#        /vendor/etc/audio/sku_pineapple/x.xml   → vendor_etc_audio_sku_pineapple
-#        /vendor/etc/audio/sku/pineapple/x.xml   → vendor_etc_audio_sku_pineapple
-#    两条路径撞成同一个键，后果是 golden/<key>.xml 与 patched/<key>.*.xml
-#    **互相覆盖**：A 的原厂备份会被 B 覆盖，卸载时的体检与还原都会用错那一份 ——
-#    又是本仓库最怕的静默错误。
-#    修法：先把组件里原有的 `_` 转义成 `__`，再用单个 `_` 作分隔符。
-#    可逆（`__`→字面下划线，单个 `_`→分隔符），且不需要额外工具。
+# 为每个策略路径生成唯一文件名键。先转义路径中的下划线，再编码路径分隔符，
+# 防止不同 SKU 路径共用同一份备份。
 lc_key() { echo "$1" | sed 's|^/||; s|/audio_policy_configuration\.xml$||; s|_|__|g; s|/|_|g'; }
 
-# 带超时执行命令。**凡是对外查询系统状态的地方都必须用它**：这套模块面对的设备
-# 可能因为别的故障长时间高负载（实测遇到过 load 57、`dumpsys` 几分钟不返回），
-# 没有超时会把 service.sh 直接挂死。找不到 timeout 时退化为直接执行，
-# 不因为缺工具而丢掉功能。
+# 限制系统查询的执行时间；没有 timeout 命令时直接执行。
 lc_tmo() {
     local secs="$1"; shift
     if command -v timeout >/dev/null 2>&1; then
@@ -148,8 +125,7 @@ lc_pick_awk() {
     return 1
 }
 
-# 打印找到的 AOSP 蓝牙音频 HAL 路径（供安装检查/诊断展示），找不到返回 1。
-# 只读，不写盘 —— 安装期检查也调它。
+# 输出 AOSP 蓝牙音频 HAL 路径；找不到时返回 1。
 lc_hal_path() {
     local d
     for d in $LHDC_HAL_DIRS; do
@@ -192,17 +168,11 @@ lc_find_candidates() {
     fi
 }
 
-# ---- sku 判定：两档线索必须分开，不能混成一个 blob ------------------------
-# 第一档是**真正的 sku 名**（bootloader 经 bootconfig 传下来），可以直接和
-# sku_xxx 目录名比。顺序即优先级，ro.boot.product.vendor.sku 最具体放最前。
+# 优先使用明确的 SKU 属性，并要求唯一匹配。
 LHDC_SKU_PROPS="ro.boot.product.vendor.sku ro.boot.sku ro.vendor.sku \
 ro.vendor.build.sku ro.boot.hardware.sku ro.boot.product.hardware.sku"
 
-# 第二档是**平台名 / SoC 名 / 设备名**，只是弱线索，命中不唯一时不能当结论。
-#   ⚠️ v2.1.0 把两档混成一个 blob 做子串匹配，结果 marble 上
-#      ro.board.platform=taro 命中了 sku_taro，而真身是 sku_ukee →
-#      一次处理两个 sku（其中一个纯属误伤）。平台名迟早会撞上别的 sku 目录名，
-#      所以必须分档：权威属性优先且要求唯一命中，弱线索只在权威档全灭时兜底。
+# 平台名、SoC 名和设备名仅作为回退线索，不能与权威 SKU 属性混用。
 lc_props_blob() {
     local p v out=""
     for p in ro.board.platform ro.hardware ro.soc.model \
@@ -213,10 +183,7 @@ lc_props_blob() {
     echo "$out" | tr 'A-Z' 'a-z'
 }
 
-# 属性值里是否含 sku 目录名这个词元：按 _ 与空白切词后**整词**比较。
-#   ukee      → 命中 ukee
-#   ukee_cdp  → 命中 ukee（QTI 的 cdp / mtp / qrd 变体）
-#   marble    → 不命中任何 sku（那是设备名，不是 sku 名）
+# 按下划线拆分属性值并整词比较，以识别 ukee_cdp 等 QTI SKU 变体。
 lc_sku_hit() {
     local tok
     for tok in $(echo "$1" | tr 'A-Z' 'a-z' | tr '_' ' '); do
@@ -247,15 +214,7 @@ lc_pick_targets() {
         [ "$DRY_RUN" = 1 ] || rm -f "$LHDC_STATE/active.path" 2>/dev/null
     fi
 
-    # 2) 显式指定 SKU
-    #
-    # ⚠️ 分两段匹配。`case "$p" in */sku_"$SKU"/*` 是**精确**匹配（要求 sku_<SKU>
-    #    后面紧跟 `/`），所以它认不出 QTI 常见的变体目录 sku_<SKU>_cdp / _mtp / _qrd。
-    #    用户按真身名填了 SKU=pineapple、而目录叫 sku_pineapple_cdp 时会**全部落空**，
-    #    然后被下面的「回退自动判定」用弱线索接管 —— 结果对不对全看运气。
-    #    这里补一段词元级变体匹配（与第 3 步 lc_sku_hit 的哲学一致）：
-    #    先精确，精确无果再收变体；变体可能多个，那就全处理
-    #    （与第 6 步「无法判定就全处理」一致：宁可多补一个，也别漏掉真身）。
+    # 2) 手动 SKU：先精确匹配，再接受 cdp / mtp / qrd 等变体。
     if [ -n "$SKU" ]; then
         m2=""; vm=""
         for p in $all; do
@@ -282,7 +241,7 @@ lc_pick_targets() {
         lc_log "WARN: SKU=$SKU 未匹配到候选，回退自动判定"
     fi
 
-    # 3) 权威 sku 属性：逐条按优先级试，**命中恰好一个**才采纳
+    # 3) 权威 SKU 属性：只有唯一命中才采纳。
     for p in $LHDC_SKU_PROPS; do
         val=$(getprop "$p" 2>/dev/null)
         [ -n "$val" ] || continue
@@ -356,29 +315,14 @@ lc_raw_read() {
     mkdir -p "$mnt" 2>/dev/null
     umount "$mnt" 2>/dev/null
     mount --bind "$root" "$mnt" 2>/dev/null || { umount "$mnt" 2>/dev/null; return 1; }
-    # ⚠️ 必须马上 make-private —— 这是 AGENTS.md 铁律 3 在**每一个** bind 点上的要求，
-    #    本函数原先漏了（全文件唯一一处）。
-    #    /vendor 实测是 shared peer group 成员（真机 Redmi K20 Pro：
-    #        /vendor ... shared:11 - erofs /dev/block/dm-1
-    #    ），所以这层 bind 一建立就加入了同一个 peer group；随后的裸 umount
-    #    会向该 group 传播一个 detach 事件 —— 与 v2.0.1 栽的是同一类事件，
-    #    最坏情况是把真正生效的补丁层一起顶掉（症状：dumpsys 里回到原厂内容、
-    #    LHDC 协商成功却无声）。
-    #    lc_clear_ghost() 正是为了这个才坚持「没 private 就不 umount」；
-    #    这里先前却直接裸 umount，属于自相矛盾。拿不到 private 就放弃本次直读
-    #    （调用方会退回「可见文件即原厂」的路径，或报错让用户先移除其它覆盖方案）。
+    # 临时分区挂载也必须立即隔离，否则卸载事件可能传播到策略补丁层。
     if ! lc_make_private "$mnt"; then
         lc_log "WARN: 无法把 $mnt 置 private（缺 busybox），放弃直读分区原文件以免误伤补丁层"
         umount "$mnt" 2>/dev/null
         return 1
     fi
     rel=${src#"$root"}
-    # ⚠️ 先把 dst 清掉再读。若源文件读不到（不存在 / 为空 / bind 没生效），
-    #    下面的 if 会整段跳过，dst 就保持**调用前的旧内容**；而末尾只检查
-    #    「非空」，于是陈旧的旧备份会被当成本次读取成功。
-    #    后果比想象严重：lc_ensure_golden 会把这个陈旧文件当作「干净原厂备份」
-    #    收进 golden（因为 lc_is_stock 只查大小/结构，认不出它是过期内容），
-    #    之后所有打补丁与还原都基于一份错的原厂副本。
+    # 先清空目标，避免读取失败后把旧内容当成本次备份。
     : > "$dst" 2>/dev/null
     if [ -s "$mnt$rel" ]; then
         cat "$mnt$rel" > "$dst" 2>/dev/null
@@ -389,20 +333,8 @@ lc_raw_read() {
     return 0
 }
 
-# 确保原厂备份存在且干净
-#
-# ⚠️ 为什么不能只判「非空 + 看着像原厂」就长期信任 golden：
-#    golden 存在 state/ 里，**跨 OTA / 重刷 vendor 存活**（只有重装模块时的
-#    customize.sh 会清掉）。若用户在刷了新 vendor 之后继续用模块，golden 仍是
-#    旧固件那份 —— 于是我们拿旧文件打补丁，再把它整个覆盖到新策略上，把新版
-#    vendor 新增/改动的端口与 profile 一并抹掉。症状是「升级后别的音频功能出问题」，
-#    极难归因到本模块。原先的判据完全看不出这种过期。
-#
-#    现在用**固件指纹**做闸门（真机实测 ro.vendor.build.fingerprint 可用）：
-#      指纹没变 → golden 直接可信，零额外开销（不必每次开机都直读分区）
-#      指纹变了 → 直读分区核对；一致就只更新指纹，不一致才重建
-#      没有指纹属性 → 退化为直读核对（多花约 100ms，真机实测）
-#      连直读都拿不到（无 busybox / 无权限）→ 保留旧判据并告警，不让模块整体失效
+# 维护原始策略副本及其 MD5 和固件指纹。指纹改变或不可用时重新读取分区核对，
+# 防止 OTA 后继续使用旧固件的 XML。无法核对时保留可用备份并记录警告。
 lc_golden_write_fp() {
     local side="$1" v
     v=$(getprop ro.vendor.build.fingerprint 2>/dev/null)
@@ -516,14 +448,8 @@ lc_gen_patched() {
 
 # ---------------------------------------------------------------- 挂载
 
-# ---- 传播隔离工具 ----------------------------------------------------------
-# toybox（Android 自带）的 `mount` **不支持** 传播选项：
-#     mount --make-private /path   →  "mount: bad /etc/fstab: No such file or directory"
-#     mount -o make-private /path  →  同上
-# 只有 busybox 的 mount 支持（`--make-private` 与 `-o private` 都行）。
-# 这点很关键：拿不到 private，我们挂的层就会留在源挂载（/data）的 peer group 里，
-# vold 在开机途中对 /data/user/0、/data_mirror/* 的挂载事件会沿 peer group 把我们
-# 的层顶掉 —— 而且 `umount` 任何一个幽灵挂载都会连带卸掉真正的补丁层。
+# busybox mount 支持 private 传播模式；Android toybox mount 不支持。
+# 缺少隔离时，/data 的挂载事件可能影响补丁层。
 LHDC_PRIV=""
 LHDC_PRIV_TRIED=0
 lc_pick_priv() {
@@ -572,11 +498,7 @@ lc_prop_mode() {
         }' /proc/self/mountinfo 2>/dev/null
 }
 
-# 读取「挂在 $1 上的那一层」**自身**的传播模式 → shared | slave | private | (无挂载)
-# ⚠️ 与 lc_prop_mode 的关键区别：后者会跳过 $1 自身，返回**包含它的父挂载**的模式。
-#    用它来显示"当前层模式"会取到父挂载（/vendor 常年是 shared），把已经 private 的
-#    层误报成 shared —— 曾因此让诊断输出与 /proc/self/mountinfo 直接矛盾。
-#    有堆叠挂载时取**最后一行**（= 最上层，即真正生效的那层）。
+# 读取 $1 最上层挂载的传播模式，而不是其父挂载的模式。
 lc_self_mode() {
     awk -v p="$1" '
         $5 == p { line = $0 }
@@ -593,18 +515,11 @@ lc_self_mode() {
         }' /proc/self/mountinfo 2>/dev/null
 }
 
-# 摘掉挂在 $1 上的"幽灵挂载"。
-# 背景：源文件在 /data（shared）上时，bind 出来的层会加入 /data 的 peer group，
-# 并反向在源路径复制出一份"幽灵挂载"盖住源文件自己。
-# ⚠️ 只有在**成功 make-private 之后**才能 umount：否则这次 umount 会沿 peer group
-#    传播，把真正的补丁层一起卸掉（v2.0.1 就栽在这里）。
+# 清除传播到源路径的挂载。卸载前必须完成 private 隔离。
 lc_clear_ghost() {
     local src="$1" n=0
     [ -n "$src" ] || return 0
-    # ⚠️ 用 grep -F 字面匹配。路径里含 '.'（audio_policy_configuration.xml），
-    #    不加 -F 时点号会被当正则通配符，可能把没挂载的近似路径误判成已挂载
-    #    （实测：/vendor/etc/audio_policyXconfiguration.xml 会命中
-    #     " /vendor/etc/audio_policy.configuration.xml " 这个模式）。
+    # 路径必须按字面匹配，不能把其中的点号当作正则通配符。
     while [ "$n" -lt 8 ] && grep -qF " $src " /proc/self/mountinfo 2>/dev/null; do
         if ! lc_make_private "$src"; then
             lc_log "WARN: 无法把 $src 置 private（缺 busybox），跳过幽灵挂载清理以免误伤补丁层"
@@ -636,22 +551,13 @@ lc_mount_overlay() {
 
     lc_unmount_dst "$dst"
 
-    # ---- 关键修正（v2.0.1）：每挂一层立刻 make-private，不能只在最后做一次 ----
-    # 我们的源文件在 /data 上，而 /data 是 shared peer group 成员。Linux 规定：
-    # 「从 shared 挂载的子树 bind 出来的新挂载，会加入**源挂载**的 peer group」。
-    # 于是挂在 /vendor/etc/... 上的这层也变成了 /data、/data/user/0、/data_mirror/*
-    # 的 peer —— 开机途中 vold 对 /data/user/0、/data_mirror/* 的挂载/卸载会沿
-    # peer group 传播过来，把我们的层顶掉。现象：post-fs-data 明明打上了，
-    # late_start 校验却是 BAD，audioserver 读到原厂配置（能协商 LHDC 却没声音）。
-    # 旧代码只在最顶层做一次 make-private，兜底层会留在 peer group 里 →
-    # 整个 overlay 仍随 /data 的挂载事件抖动。
+    # 两层挂载分别隔离；仅处理顶层不能保护底层。
     if [ -n "$base" ] && [ -f "$base" ]; then
         chcon u:object_r:vendor_configs_file:s0 "$base" 2>/dev/null
         if mount --bind "$base" "$dst" 2>/dev/null; then
             lc_make_private "$dst"
             m=$(lc_self_mode "$dst")
-            # 日志以**实测**为准，不写乐观常量：v2.0.1 就是既把 make-private 的
-            # 失败 2>/dev/null 吞掉、又硬编码打印"（private）"，日志才长期撒谎。
+            # 记录实际传播模式，不以命令调用代替结果检查。
             if [ "$m" = private ]; then
                 lc_log "BASE: 兜底层已挂载（实测 private）"
             else
@@ -731,17 +637,8 @@ lc_gate() {
 
 # ---------------------------------------------------------------- 并发锁
 #
-# ★ 为什么需要：post-fs-data 与 service 都会调 lc_apply_all，而 README 还鼓励
-#   用户手动跑 `sh post-fs-data.sh` 诊断。两个实例撞在一起时：
-#     - tag 只保证**文件名**唯一，保不住下面那句 `rm -f work/*.xml` 的清扫
-#     - 若 A 在「cp golden→work」之后、mount 之前执行清扫，B 的挂载源就没了
-#       → B 报 BASE/TOP 挂载失败，随后又因为看到 A 的层而报 RESULT: OK
-#     - 两个实例还会并发写 golden
-#   结果是一堆自相矛盾的日志（FAIL 之后紧跟 OK），排查时极费神。
-#   参考实现：mkdir 是原子的 test-and-set，POSIX 与 busybox 都支持。
-#
-# ⚠️ 必须处理**陈旧锁**：进程被 kill / 掉电会留下锁目录，不清理就会永久卡住。
-#    判据用「锁里的 pid 还活着吗」——比按时间猜可靠，且开机后 pid 空间是新的。
+# mkdir 提供原子锁，防止多个 apply 同时清理挂载源或写备份。
+# 通过记录的 PID 识别进程退出后遗留的锁。
 lc_lock_dir() { echo "$LHDC_STATE/.lock"; }
 
 lc_lock_acquire() {
@@ -791,17 +688,11 @@ lc_apply_all() {
     local targets
     targets=$(lc_pick_targets) || { lc_log "SKIP: 找不到可处理的 audio_policy_configuration.xml"; lc_lock_release; return 1; }
 
-    # 每次 apply 用唯一的 tag 命名挂载源，这样绝不会有"上一次留下的幽灵挂载"
-    # 盖住这次要用的文件（同一个 boot 里 service 阶段可能再补做一次）。
+    # 每次 apply 使用新的挂载源名称，避开旧挂载残留。
     tag="$$.$(date +%s 2>/dev/null)"
     mkdir -p "$LHDC_STATE/patched" "$LHDC_STATE/work" 2>/dev/null
 
-    # 清掉历史副本。
-    # ⚠️ 通配要写成 *.xml*（带上尾随的 *）——lc_gen_patched 先写 "$out.tmp"
-    #    再 mv 成 "$out"，所以中途被杀会留下 `...xml.tmp`；而 `*.xml` **匹配不到**
-    #    它。那个残留只有一个来源（进程被杀，且它自己的清理跑不到），
-    #    于是会永久占着一份策略文件大小的空间，且谁都不会清。
-    #    被幽灵挂载盖住的删不掉（EBUSY），忽略即可 —— 下次开机会清成功。
+    # 同时清理完成和中途遗留的 XML 临时文件。
     rm -f "$LHDC_STATE"/work/*.xml* "$LHDC_STATE"/patched/*.xml* 2>/dev/null
 
     for dst in $targets; do
@@ -848,10 +739,7 @@ lc_verify() {
 }
 
 # -- 运行态校验 ---------------------------------------------------------------
-# 文件级挂载生效 ≠ audioserver 加载了它。audioserver 在 main class 启动
-# （本机约开机第 11 秒），如果补丁层在那之前掉了或还没打上，它读的就是原厂
-# 配置 —— 表现为"能协商 LHDC 但完全没声音"。这里用运行时转储做最终判定：
-# 原厂配置里绝不会出现 AUDIO_FORMAT_LHDC，出现即说明加载的是补丁版。
+# 文件挂载成功不代表 audioserver 已重新读取它；使用运行中的策略转储复查。
 lc_ensure_running() {
     local dump n
     dump=$(lc_dumpsys_ap)
@@ -887,29 +775,9 @@ lc_ensure_running() {
     return 1
 }
 
-# 运行态自检：确认 a2dp output 这个输出档的**采样率真的被解析出来了**。
-# 参数：audio_policy 的 dumpsys 转储文本
-#
-# ★ 为什么必须单独查这一项（2026-09-18 在 Redmi K20 Pro 上踩到的坑）
-#   XML 里「列表型属性」的分隔符风格写错时，解析器**不会报任何错**，
-#   只会把该 profile 悄悄降级成 "[dynamic rates]"（采样率表为空）。随后：
-#       W APM_AudioPolicyManager: openOutputWithProfileAndDevice() missing param
-#       W APM_AudioPolicyManager: checkOutputsForDevice(): No output available for device 0080
-#   → A2DP 输出永远建不起来 → A2DP 设备永远不可用（AudioDeviceInventory 报
-#   "APM failed to make available A2DP device"）→ 蓝牙彻底无声。
-#   全链路没有半条显式错误，而且本模块的 LHDC 声明检查照样全绿
-#   （因为 encodedFormats 是对的、只有 samplingRates 崩了），极易漏判。
-#   分隔符风格由根元素 version 决定（7.0/7.1 → 空格，1.0 → 逗号），
-#   patch_policy.awk 会据此生成；这里是它的运行态对账。
-#
-# ⚠️ 判定顺序很关键，写反了就会把失败态判成通过（假绿）。
-#   AudioProfile::dump 的格式串（libaudiofoundation.so 里可见）是：
-#       "%*ssampling rates: "     ← 前缀
-#       "[dynamic rates]"         ← 动态时的占位值
-#   即失败态打印为**同一行**的：
-#       sampling rates: [dynamic rates]
-#   所以必须先匹配 "[dynamic rates]"，再匹配 "sampling rates:"
-#   —— 否则 *"sampling rates:"* 会先命中，把失败态报成「已正确解析」。
+# 检查 dumpsys 中 a2dp output 的实际采样率。
+# 错误的 XML 列表格式会显示为 sampling rates: [dynamic rates]，因此必须先检查
+# 失败标记，再读取非空采样率列表。
 lc_check_a2dp_profile() {
     local seg val
     [ -n "$1" ] || { lc_log "A2DP: 无转储，跳过采样率解析自检"; return 0; }
@@ -993,14 +861,7 @@ lc_report() {
                     if ($i ~ /^master:/)        mode = "slave"
                     if ($i ~ /^propagate_from/) mode = "slave"
                 }
-                # ⚠️ 绑定来源是第 4 列（root），不是分隔符后第 2 列（那是**源设备**，
-                #    例如 /dev/block/dm-45）。
-                #    mountinfo 的字段是：
-                #      id parent major:minor **root** mountpoint options [optional...] - fstype source superopts
-                #    对本模块的层，root 才是「从哪个文件 bind 过来的」
-                #    （真机实测：/adb/modules/.../state/work/vendor_etc.<tag>.xml）。
-                #    这一行原先打印 sep+2，于是诊断里显示的是块设备，答不出
-                #    「这层到底是哪份文件」，与 README 展示的样例也对不上。
+                # mountinfo 第 4 列是 bind 来源路径，分隔符后的 source 是设备名。
                 printf "  [%-7s] %s\n                  ← %s\n", mode, $5, $4
             }'
     else

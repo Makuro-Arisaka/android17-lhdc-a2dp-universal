@@ -1,104 +1,140 @@
-# AGENTS.md — 给 AI 编码助手 / 贡献者看的仓库说明
+# 开发指南
 
-> 本文面向在**本仓库**里工作的 AI 助手与人类贡献者，讲的是「怎么改才不踩坑」，
-> 不是给最终用户看的。用户文档见 [README.md](README.md)（中文）与 [README.en.md](README.en.md)（英文）。
+本文说明仓库结构、修改约束和验证方法。面向用户的使用说明见
+[README.md](README.md) 和 [README.en.md](README.en.md)。
 
-## 这是什么
+## 项目结构
 
-一个 Magisk / KernelSU / APatch 模块：运行时用 bind mount 覆盖
-`audio_policy_configuration.xml`，把 A2DP 输出端口迁进名为 `bluetooth` 的 module
-并声明 `AUDIO_FORMAT_LHDC`，让 Android 17 的**原生** LHDC 软件编码器真正出声。
+这是一个 Android 17 音频策略模块，支持 Magisk、KernelSU 和 APatch。它把 A2DP
+端口移入 `bluetooth` module 并补全 LHDC、mixPort 和 route，使 AOSP 蓝牙栈能够
+通过 `audio.bluetooth.default.so` 使用软件编码。
 
-- 目标场景：**LHDC 协商成功（`Current Codec: LHDCv5`）但完全无声**
-- 适用：AOSP 蓝牙栈 + 高通 PAL 的**混合架构**（如刷了 Android 17 类原生的高通机）
-- 不适用：MTK / 联发科（无高通 PAL，断链不存在）、编码器缺失（Android < 17）、
-  纯高通栈（offload 本来就通）
+模块不提供编码器。适用目标是 AOSP 蓝牙栈与高通 PAL 共存的设备。
 
-模块**不提供编码器，只做路由**。它**不改任何分区文件**——所有修改活在模块自己的
-`state/` 目录和内存挂载表里（唯一的持久改动是一个 `persist.*` 属性 + 两处备份副本）。
+| 路径 | 职责 |
+|---|---|
+| `customize.sh` | 安装时检查运行条件、修正权限并清理旧运行数据 |
+| `post-fs-data.sh` | 开机早期定位、备份、修改并挂载音频策略 |
+| `service.sh` | 启动后复查策略和 audioserver，记录活跃文件并导出备份 |
+| `uninstall.sh` | 卸载挂载、检查原始文件并清理运行数据 |
+| `lib/common.sh` | 设备脚本共用的函数；通过 `source` 加载 |
+| `lib/install_check.sh` | 安装时的只读检查和控制台输出 |
+| `lib/patch_policy.awk` | 使用 POSIX awk 修改音频策略 XML |
+| `lhdc.conf` | 用户配置 |
+| `module.prop` | 模块元数据及版本 |
+| `build.sh` | 构建、静态检查和打包 |
+| `tests/` | 安装检查的本地测试及 XML fixtures |
 
-## 铁律：改任何东西之前先读懂这四条
+## 音频策略约束
 
-这四条是整个仓库踩出来的核心结论，违反其中任何一条都会**静默失效**（不报错、自检却照常全绿），务必牢记：
+修改补丁器或验证逻辑时，应保留以下行为。
 
-1. **A2DP 的 devicePort 必须挂在名为 `bluetooth` 的 module 下**，挂 `primary` 会静默无声。
-   HAL 按 `audio.<moduleName>.default.so` 查找，而这些机器上没有 `audio.a2dp.default.so`。
-2. **XML 列表分隔符由根元素 `version` 决定，与 Android 版本无关**（`7.0`/`7.1` → 空格，
-   `1.0` → 逗号；依据是 `Serializer.cpp` 的 `mSamplingRatesSeparator` 赋值）。写错不报错，
-   只把 profile 降级成 `[dynamic rates]` → A2DP 打不开、蓝牙无声。
-   `sep_by_version()` 按 `version` 判定（权威来源），`detect_sep()` 只在 `version`
-   读不到时兜底。**`encodedFormats` 是例外**：AOSP 对它写死空格
-   （`Serializer.cpp:568`），**禁止**让它跟随 `samplingRates` 的风格。
-   **禁止按机型/ROM 硬编码分隔符。**
-3. **「已是目标形态」（awk 退出码 2）的判据必须含三样**：端口在 `bluetooth` 下、
-   端口声明了 LHDC、且 `a2dp output` mixPort 与指向它的 route 都存在。
-   只看 devicePort 会把「端口齐但无出口」的半成品判成无需改动 —— 照样静默无声，
-   而模块自检全绿。判定这类「假绿」要拿判据本身去对，不要只信自检输出。
-4. **bind mount 必须逐层 `--make-private`，且 toybox 的 `mount` 做不到**（报 bad /etc/fstab）。
-   必须用 busybox 的 `mount`。不置 private，层会留在 `/data` 的 peer group 里被开机事件顶掉。
+### Module 和路由
 
-判定「真生效」的一眼判据（不要只看模块自检，那可能是绿的）：
+- A2DP devicePort 必须属于名为 `bluetooth` 的 module，HAL 名称由
+  `audio.<moduleName>.default.so` 决定。
+- 完整的输出路径需要 A2DP devicePort、`a2dp output` mixPort 及对应 route。
+- `patch_policy.awk` 的退出码 `2` 表示无需修改；只有上述三部分都完整时才能返回它。
+- 已部分迁移或通过 `xi:include` 引入的策略也要正确处理，避免重复节点。
+- 只修改 A2DP 端口，不要把助听器等其他蓝牙输出改成 LHDC。
+
+### XML 列表格式
+
+`samplingRates` 和 `channelMasks` 的分隔符由根元素 `version` 决定：
+
+| `version` | 分隔符 |
+|---|---|
+| `1.0` | 逗号 |
+| `7.0` / `7.1` | 空格 |
+
+`encodedFormats` 固定使用空格，不采用上述规则。`sep_by_version()` 是主要判定
+方法，`detect_sep()` 只用于无法读取有效版本时的回退。不要根据机型或 Android
+版本推断分隔符。
+
+格式错误可能不会产生直接的 XML 错误，而会让 dumpsys 中的 profile 显示为
+`[dynamic rates]`。因此验证时除了检查 LHDC，还要检查 `a2dp output` 的采样率：
 
 ```sh
 dumpsys media.audio_policy | grep -A5 '"a2dp output";'
-# 必须看到 "sampling rates: 44100, 48000, 88200, 96000"
-# 若为 "[dynamic rates]" → 分隔符风格不对，无声
 ```
 
-## 构建与打包：只准用 build.sh，别手工 zip
+### 挂载与原始文件
+
+- 不要直接改写 `/vendor`、`/odm` 等分区上的策略文件。
+- `state/golden/` 保存原始副本，不作为挂载源；`state/work/` 和
+  `state/patched/` 分别用于兜底层和补丁层。
+- 每次 bind mount 后都应尽快用 busybox 执行 `mount --make-private`。toybox
+  mount 不支持所需选项。
+- 缺少 busybox 时按现有逻辑报告能力降级，不要把未隔离的挂载记录为 private。
+- 卸载或清理 `state/` 前必须处理其中的挂载点，尤其是 `state/raw/`。
+- 原始备份需要随固件变化重新核对，不能仅凭旧文件存在就继续复用。
+
+## 安装检查
+
+`customize.sh` 的执行顺序是：
+
+1. 修正模块目录和脚本权限；
+2. 设置 `DRY_RUN=1`，加载公共函数及安装检查；
+3. 检查 awk、SDK、蓝牙 HAL 和候选策略，并试运行补丁器；
+4. 检查失败时通过 `abort` 返回安装失败；
+5. 检查成功后清理旧 `state/` 并完成安装。
+
+权限修正必须早于 `source`，因为 KernelSU 解压可能连目录执行位也不保留。
+安装检查必须保持只读，不得创建 `state/`、写日志或应用挂载。`FORCE=1` 保留为
+跳过检查的选项。
+
+`lib/common.sh` 同时被安装环境和开机脚本加载。读取可能未定义的环境变量时使用
+`${VAR:-}`，避免不同 root 管理器的 shell 选项导致安装失败。用于命令替换返回
+结果的函数不要把日志写到 stdout；调试输出走 stderr。
+
+## 修改与验证
+
+设备脚本以 POSIX shell / busybox ash 为目标，补丁器保持 POSIX awk 兼容，避免
+依赖 GNU awk、Python 或仅开发机具备的工具。
+
+相关改动后至少运行：
 
 ```bash
-./build.sh                      # 输出 ../android17-lhdc-a2dp-universal.zip + .sha256
-./build.sh --reproducible       # 可复现：同一 commit 任意机器字节一致
-./build.sh --allow-dirty        # 工作区脏时放行（未跟踪文件不进包）
+for f in customize.sh post-fs-data.sh service.sh uninstall.sh \
+         lib/common.sh lib/install_check.sh; do
+    busybox ash -n "$f"
+done
+bash -n build.sh
+awk -f lib/patch_policy.awk </dev/null  # 预期报 input too small，不应有语法错误
+bash tests/run-install-check.sh
+./build.sh --allow-dirty -o /tmp/lhdc-check.zip
 ```
 
-- **文件清单来自 `git ls-files`**，不在排除表里的都会进包。所以**新增仓库文件时，
-  必须同时判断它该不该进包**，该排除就加进 `build.sh` 的 `is_excluded()`。
-- **不该进包的东西**：`.github/`、`README.en.md`、`AGENTS.md`、`build.sh`、`.git*`、
-  `tests/`、`state/`、取证文件（`ap.txt`/`dumpsys*.txt` 等）、`.zip`/`.sha256`。判断标准：
-  设备侧运行时用不到的、只服务于开发/GitHub 的，一律不进包。
-  `tests/` 属此类（依赖 bash、git、可写临时目录）；但 `lib/install_check.sh`
-  **必须进包** —— 设备上的 `customize.sh` 要 source 它。
-- **跨机器可复现的两个坑**（已修，别回退）：① zip 条目顺序要靠显式排序的文件列表，
-  不能 `zip -r .`（readdir 顺序随文件系统变）；② 权限位要全量显式 chmod
-  （目录 755 / 根脚本 755 / 其余 644），且根脚本那条必须配 `-maxdepth 1`，
-  否则被 source 的 `lib/*.sh` 会被误设成 755。
-- 每次改动 `README.md`、`module.prop`、`lib/*` 等**进包文件**，都会改变包 sha256。
-  想更新线上 Release，就改 `module.prop` 版本号 → 提交 → 推 `v*` 标签（触发 Actions 自动发版）。
+新增 XML 场景时，同时添加 fixture 和断言，至少检查首次生成、再次处理和已有
+目标形态的行为。仅验证脚本退出成功不够，还要检查生成的端口、mixPort、route
+和分隔符。
 
-## 目录与职责
+如果进行真机测试，结束后移除测试模块、临时安装包和挂载，并确认分区策略恢复
+原状。用户已有模块和运行数据不属于测试清理范围。
 
-| 路径 | 职责 | 进包？ |
-|---|---|---|
-| `module.prop` | 模块声明（id / 版本 / 描述） | ✅ |
-| `lhdc.conf` | 用户可改配置（SKU / FORCE / MIN_SDK …） | ✅ |
-| `customize.sh` | 安装期：**先查适用范围**（不满足即 abort），再补脚本 x 位 + 清残留 state | ✅ |
-| `post-fs-data.sh` | 早于 audioserver：定位→备份→打补丁→挂载；`--dry-run` 只读诊断 | ✅ |
-| `service.sh` | late_start：校验 overlay + 运行态自检 + 反查活跃策略 | ✅ |
-| `uninstall.sh` | 摘挂载 + 原文件体检 + 必要时兜住 | ✅ |
-| `lib/common.sh` | 共享函数库（被 source，**必须 644**） | ✅ |
-| `lib/install_check.sh` | 安装期只读检查（被 customize.sh source，**必须 644**） | ✅ |
-| `lib/patch_policy.awk` | XML 补丁器（POSIX awk，设备上无 Python） | ✅ |
-| `tests/run-install-check.sh` + `tests/fixtures/` | 本地回归测试（假设备 + 最小化 XML 样例），用假 vendor 树与 getprop/ui_print/abort 垫片跑 | ❌ |
-| `build.sh` | 打包脚本 | ❌ |
-| `.github/` | Actions 发版 workflow + Release 模板 | ❌ |
-| `README.md` / `README.en.md` | 用户文档（前者进包，后者不进） | 见右 |
-| `AGENTS.md` | 本文档 | ❌ |
-| `state/` | 运行时生成（备份 / 日志 / active.path） | ❌ |
+## 打包与发布
 
-## 提交约定（跟随仓库既有习惯）
+统一使用构建脚本：
 
-- 分支 `main`；提交信息**中文**，标题「动作：要点」，正文分段说明改了什么、为什么改
-- 提交前自检：`bash -n` 各 `.sh`（build.sh 是 bash，设备侧脚本用 `busybox ash -n`）、
-  LF 行尾（CRLF 拒绝）、无 BOM
-- **推送前必 `git fetch`**：本仓库 README 常由维护者在 GitHub 网页端直接改，
-  本地 `origin/*` 是旧快照。若已分叉用 `git rebase origin/main` 重放，**绝不 force push**。
+```bash
+./build.sh
+./build.sh --reproducible
+./build.sh -o /tmp/module.zip
+./build.sh --allow-dirty
+```
 
-## 发版流程
+打包清单来自 `git ls-files`。新增仓库文件时检查 `build.sh` 的 `is_excluded()`，
+决定它是否属于设备运行所需内容。开发工具、CI、测试、`state/` 和取证输出不进包；
+`lib/install_check.sh` 需要进包。中文 README 进包，英文 README 不进包。
 
-1. 改 `module.prop` 的 `version` / `versionCode`（versionCode 递增）
-2. 提交
-3. `git tag vX.Y.Z && git push origin vX.Y.Z` → Actions 自动构建并发布 Release
+构建脚本负责排序 zip 条目并统一权限：目录和根目录脚本为 `755`，库及其他文件为
+`644`。不要在递归 chmod 中把 `lib/*.sh` 设为可执行。进包文件变化会影响 SHA-256。
 
-推 `main` 不触发发版，只有推 `v*` 标签才触发。
+发布步骤：
+
+1. 递增 `module.prop` 的 `version` 和 `versionCode`；
+2. 完成验证并提交；
+3. 创建并推送 `v*` 标签，由 GitHub Actions 构建 Release。
+
+提交信息使用中文，标题采用「动作：要点」。提交前检查 LF 行尾和无 BOM。
+推送前执行 `git fetch`，必要时将本地提交 rebase 到 `origin/main`，不要 force push。
